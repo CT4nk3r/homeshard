@@ -40,15 +40,17 @@ export function CreateInstanceForm() {
 
   async function stagePack(file: File): Promise<PackSource> {
     if (file.size > 250 * 1024 * 1024) throw new Error("Pack exceeds the 250 MB limit");
-    if (!file.name.toLowerCase().endsWith(".zip") && !file.name.toLowerCase().endsWith(".mrpack")) {
-      throw new Error("Pack must be a CurseForge ZIP or Modrinth .mrpack file");
+    const lower = file.name.toLowerCase();
+    const isModlist = lower.endsWith(".json");
+    if (!lower.endsWith(".zip") && !lower.endsWith(".mrpack") && !isModlist) {
+      throw new Error("Pack must be a CurseForge ZIP, Modrinth .mrpack, or Prism modlist .json file");
     }
 
     if (mode === "blob") {
       const blob = await upload(`staging/packs/${file.name}`, file, {
         access: "private",
         handleUploadUrl: "/api/packs/upload",
-        contentType: "application/zip",
+        contentType: isModlist ? "application/json" : "application/zip",
       });
       return {
         kind: "blob",
@@ -83,7 +85,7 @@ export function CreateInstanceForm() {
       if (command.status === "queued") {
         setMessage("Queued. Waiting for the homeserver agent to pick it up...");
       } else if (command.status === "claimed") {
-        setMessage("Agent is working: validating the pack, importing through Prism if needed, and launching the instance...");
+        setMessage("Agent is working: validating the pack, installing mods, and launching the instance...");
       } else if (command.status === "succeeded") {
         const instanceId = command.instanceId ?? command.result?.data?.instanceId;
         setMessage(command.result?.message ?? "Instance created.");
@@ -152,7 +154,7 @@ export function CreateInstanceForm() {
       const body = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(body.error ?? "Could not upload missing mods");
       const uploaded = Array.isArray(body.uploaded) ? body.uploaded.length : files.length;
-      setMissingMessage(`Uploaded ${uploaded} missing mod jar${uploaded === 1 ? "" : "s"}. Prism will pick them up during import.`);
+      setMissingMessage(`Uploaded ${uploaded} missing mod jar${uploaded === 1 ? "" : "s"}; they'll be used on the next deploy.`);
     } catch (error) {
       setMissingMessage(error instanceof Error ? error.message : "Could not upload missing mods");
     } finally {
@@ -171,9 +173,9 @@ export function CreateInstanceForm() {
       <div className="space-y-2"><label htmlFor="memoryMb" className="text-sm font-medium">Memory recommendation (MiB)</label><Input id="memoryMb" name="memoryMb" type="number" min="2048" max="12288" step="1024" defaultValue="8192" /></div>
       <div className="space-y-2"><label htmlFor="levelSeed" className="text-sm font-medium">World seed <span className="text-muted-foreground">(optional)</span></label><Input id="levelSeed" name="levelSeed" placeholder="Leave blank for random" maxLength={128} /></div>
       <div className="space-y-2">
-        <label htmlFor="pack" className="text-sm font-medium">Modpack ZIP <span className="text-muted-foreground">(optional)</span></label>
-        <Input id="pack" name="pack" type="file" accept=".zip,.mrpack,application/zip" />
-        <p className="flex items-center gap-1.5 text-xs text-muted-foreground"><FileArchive className="size-3.5" />{mode === "blob" ? "Private temporary Blob staging. CurseForge packs also need a matching fresh Prism import." : mode === "local" ? "Homeserver local test staging. CurseForge packs also need a matching fresh Prism import." : "Generated worlds only until staging is configured"}</p>
+        <label htmlFor="pack" className="text-sm font-medium">Modpack <span className="text-muted-foreground">(optional)</span></label>
+        <Input id="pack" name="pack" type="file" accept=".zip,.mrpack,.json,application/zip,application/json" />
+        <p className="flex items-center gap-1.5 text-xs text-muted-foreground"><FileArchive className="size-3.5" />CurseForge ZIP, Modrinth .mrpack, or a Prism modlist .json export. For a Prism modlist, the server type + Minecraft version above are used to resolve each mod.</p>
       </div>
       {message && <p className="rounded-md bg-secondary p-3 text-sm">{message}</p>}
       <Button disabled={busy}>{busy && <Loader2 className="size-4 animate-spin" />}{busy ? "Preparing instance..." : "Create instance"}</Button>
@@ -181,7 +183,7 @@ export function CreateInstanceForm() {
     <form action={uploadMissingMods} className="space-y-3 rounded-lg border p-4">
       <div className="space-y-1">
         <label htmlFor="missingMods" className="text-sm font-medium">Blocked CurseForge mod jars</label>
-        <p className="text-xs text-muted-foreground">If Prism says a mod is blocked, download the jar from CurseForge and upload it here. Files are saved to the server&apos;s missing-mods folder for Prism to scan.</p>
+        <p className="text-xs text-muted-foreground">If a mod is blocked from automatic download, download the jar from CurseForge and upload it here so the next deploy can use it.</p>
       </div>
       <Input id="missingMods" name="missingMods" type="file" accept=".jar,application/java-archive" multiple />
       {missingMessage && <p className="rounded-md bg-secondary p-3 text-sm">{missingMessage}</p>}

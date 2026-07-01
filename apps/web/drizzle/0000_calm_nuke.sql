@@ -40,7 +40,7 @@ CREATE TABLE "commands" (
 --> statement-breakpoint
 CREATE TABLE "hosts" (
 	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
-	"name" text DEFAULT 'ct4nk3r-homeserver' NOT NULL,
+	"name" text DEFAULT 'homeserver' NOT NULL,
 	"agent_id" text NOT NULL,
 	"magic_dns_name" text NOT NULL,
 	"status" text DEFAULT 'offline' NOT NULL,

@@ -5,7 +5,7 @@ import { strFromU8, unzipSync } from "fflate";
 export const MAX_PACK_BYTES = 250 * 1024 * 1024;
 
 export type PackSummary = {
-  format: "curseforge" | "modrinth";
+  format: "curseforge" | "modrinth" | "prism-modlist";
   name: string;
   minecraftVersion: string;
   loader: string;
@@ -25,8 +25,9 @@ export type PackSource = {
 
 export function safeZipName(name: string) {
   const base = path.basename(name).replace(/[^a-zA-Z0-9._-]+/g, "-");
-  if (!base.toLowerCase().endsWith(".zip") && !base.toLowerCase().endsWith(".mrpack")) {
-    throw new Error("Pack must be a CurseForge ZIP or Modrinth .mrpack file");
+  const lower = base.toLowerCase();
+  if (!lower.endsWith(".zip") && !lower.endsWith(".mrpack") && !lower.endsWith(".json")) {
+    throw new Error("Pack must be a CurseForge ZIP, Modrinth .mrpack, or Prism modlist .json file");
   }
   return base.slice(0, 128);
 }
@@ -35,7 +36,35 @@ export function sha256(bytes: Uint8Array) {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
+/** Detect a PrismLauncher JSON modlist export: an array of mod entries each with
+ * a `url` and (usually) a `filename`. Loader + MC version are not in the export. */
+export function inspectPrismModlist(bytes: Uint8Array): PackSummary | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(strFromU8(bytes).replace(/^\uFEFF/, ""));
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0) return null;
+  const entries = parsed as Array<{ url?: unknown; filename?: unknown }>;
+  const looksLikeModlist = entries.every(
+    (entry) => entry && typeof entry === "object" && typeof entry.url === "string",
+  );
+  const withFiles = entries.filter((entry) => typeof entry.filename === "string" && entry.filename);
+  if (!looksLikeModlist || withFiles.length === 0) return null;
+  return {
+    format: "prism-modlist",
+    name: "Prism modlist",
+    minecraftVersion: "unknown",
+    loader: "unknown",
+    fileCount: entries.length,
+  };
+}
+
 export function inspectPack(bytes: Uint8Array): PackSummary {
+  const modlist = inspectPrismModlist(bytes);
+  if (modlist) return modlist;
+
   const selected = unzipSync(bytes, {
     filter: (file) => {
       const selected = file.name === "manifest.json" || file.name === "modrinth.index.json";

@@ -39,7 +39,6 @@ export type DashboardSnapshot = {
     nvmeFreeGb: number;
     coldUsedGb: number;
     coldLimitGb: number;
-    prismInstancesConfigured: boolean;
   };
   instances: DashboardInstance[];
   pendingUsers: number;

@@ -8,9 +8,9 @@ name: homeshard
 #   docker compose --profile agent up -d --build    # also run the homeserver agent
 #
 # IMPORTANT — identity mounts: the agent launches game containers through the
-# host Docker socket and hands the host-side Prism importer real host paths, so
-# the live-instance and cold-storage directories are bind-mounted at the SAME
-# path inside the agent as on the host. Never remap only one side of those two.
+# host Docker socket, so the live-instance and cold-storage directories are
+# bind-mounted at the SAME path inside the agent as on the host. Never remap
+# only one side of those two.
 
 services:
   postgres:
@@ -77,7 +77,7 @@ services:
       - "${WEB_PORT:-8010}:3000"
     volumes:
       - ${HOST_STAGING_DIR:-./data/staging}:/staging
-      - ${HOST_MISSING_MODS_DIR:-./data/missing-mods}:/missing-mods
+      - ${HOST_MISSING_MODS_DIR:-/srv/homeshard/missing-mods}:/missing-mods
 
   agent:
     profiles: ["agent"]
@@ -98,18 +98,20 @@ services:
       # to keep servers private, or 0.0.0.0 to expose on all interfaces.
       HOMESHARD_GAME_BIND_IP: ${HOMESHARD_GAME_BIND_IP:-0.0.0.0}
       HOMESHARD_MINECRAFT_IMAGE: ${HOMESHARD_MINECRAFT_IMAGE:-itzg/minecraft-server:java21}
+      # JRE image for newer Minecraft (e.g. 26.x). Classic 1.x packs use the
+      # image above; the agent picks the right one per pack automatically.
+      HOMESHARD_MINECRAFT_IMAGE_MODERN: ${HOMESHARD_MINECRAFT_IMAGE_MODERN:-itzg/minecraft-server:java25}
       # Identity-mounted host directories (see IMPORTANT note above).
       HOMESHARD_ACTIVE_ROOT: ${HOST_INSTANCES_DIR:-/srv/homeshard/instances}
       HOMESHARD_COLD_ROOT: ${HOST_COLD_DIR:-/srv/homeshard/cold}
       HOMESHARD_STAGING_ROOT: /staging
       HOMESHARD_MAX_CONCURRENT_COMMANDS: ${HOMESHARD_MAX_CONCURRENT_COMMANDS:-6}
-      # --- Minecraft CurseForge (Prism) import support (optional) ---
-      HOMESHARD_PRISM_INSTANCES_ROOT: /prism/instances
-      HOMESHARD_PRISM_IMPORT_COMMAND: /usr/local/bin/homeshard-prism-import
-      HOMESHARD_PRISM_HOST_IMPORT_SCRIPT: ${HOST_PRISM_IMPORT_SCRIPT:-}
-      HOMESHARD_PRISM_USER: ${HOMESHARD_PRISM_USER:-}
-      HOMESHARD_PRISM_DISPLAY: ${HOMESHARD_PRISM_DISPLAY:-}
-      HOMESHARD_PRISM_MISSING_MODS_DIR: ${HOST_MISSING_MODS_DIR:-./data/missing-mods}
+      # --- Headless CurseForge import (optional) ---
+      # Set CF_API_KEY to import CurseForge modpack ZIPs directly (no Prism).
+      # See the README for how to obtain a key. Author-restricted "blocked" mods
+      # are read from the missing-mods dir below; upload them via the dashboard.
+      CF_API_KEY: ${CF_API_KEY:-}
+      HOMESHARD_MISSING_MODS_DIR: ${HOST_MISSING_MODS_DIR:-/srv/homeshard/missing-mods}
       BLOB_READ_WRITE_TOKEN: ${BLOB_READ_WRITE_TOKEN:-}
       RUST_LOG: homeshard_agent=info
     volumes:
@@ -118,9 +120,9 @@ services:
       - ${HOST_INSTANCES_DIR:-/srv/homeshard/instances}:${HOST_INSTANCES_DIR:-/srv/homeshard/instances}
       - ${HOST_COLD_DIR:-/srv/homeshard/cold}:${HOST_COLD_DIR:-/srv/homeshard/cold}
       - ${HOST_STAGING_DIR:-./data/staging}:/staging
-      # Minecraft/CurseForge only: read-only PrismLauncher instances directory.
-      - ${HOST_PRISM_INSTANCES_DIR:-./data/prism-instances}:/prism/instances:ro
-      - ./prism-import-container.sh:/usr/local/bin/homeshard-prism-import:ro
+      # Blocked-mod uploads. Identity-mounted so servers the agent launches can
+      # read the same host folder the dashboard writes uploads to.
+      - ${HOST_MISSING_MODS_DIR:-/srv/homeshard/missing-mods}:${HOST_MISSING_MODS_DIR:-/srv/homeshard/missing-mods}
 
 volumes:
   homeshard-db:

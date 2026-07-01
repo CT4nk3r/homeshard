@@ -14,7 +14,7 @@ packs, launching Docker game servers, syncing mods, and taking backups.
 |-----------|------|--------------|
 | **Web dashboard** | `apps/web` | Next.js control plane. Queues commands, shows instance/host status, handles pack + mod uploads. |
 | **Agent** | `crates/agent` | Rust worker on the home server. Claims commands from Postgres and runs Docker game servers. |
-| **Infra** | `infra/homeserver` | `docker compose` stack (Postgres + migrations + web + agent) and the CurseForge import helper. |
+| **Infra** | `infra/homeserver` | `docker compose` stack: Postgres, migrations, the web dashboard, and the agent. |
 
 The web app and the agent are decoupled: they only talk through the Postgres
 `commands` table. The agent processes commands **concurrently, but keeps each
@@ -72,18 +72,18 @@ path it hands to Docker must be valid on the host. That's why `HOST_INSTANCES_DI
 and `HOST_COLD_DIR` are bind-mounted at the **same path** inside the agent as on
 the host. Change both sides together, or neither.
 
-## CurseForge imports (optional, advanced)
+## CurseForge imports (optional)
 
-CurseForge modpacks often contain mods the author blocks from third-party
-download. Homeshard imports them by driving a real
-[PrismLauncher](https://prismlauncher.org) install on the host. This is the
-trickiest part to set up and is entirely optional — Modrinth packs and vanilla/
-Fabric/Forge servers work without it. See
+CurseForge modpacks import directly from their pack ZIP — no PrismLauncher or
+desktop app required. Set a `CF_API_KEY` in `.env` to enable it (Modrinth
+`.mrpack` packs and vanilla/Fabric/Forge/NeoForge servers work with no key). You
+can also import a PrismLauncher **modlist JSON export**. See
 [`infra/homeserver/README.md`](infra/homeserver/README.md) for details.
 
-When a pack has blocked mods, the deploy fails with a clear, per-mod list of
-download links in the dashboard; download each file, add it through the UI, and
-retry the deploy.
+Some CurseForge projects block automated third-party downloads. When a pack
+includes them the deploy pauses with a clear, per-mod list of download links in
+the dashboard; download each file, upload it through the UI, and retry the
+deploy.
 
 ## Development
 

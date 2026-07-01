@@ -18,7 +18,6 @@ export async function getDashboardSnapshot(actor: Actor): Promise<DashboardSnaps
         nvmeFreeGb: 99,
         coldUsedGb: 0,
         coldLimitGb: 500,
-        prismInstancesConfigured: false,
       },
       instances: [
         {
@@ -62,7 +61,6 @@ export async function getDashboardSnapshot(actor: Actor): Promise<DashboardSnaps
       nvmeFreeGb: numberMetric("nvmeFreeGb", 0),
       coldUsedGb: numberMetric("coldUsedGb", 0),
       coldLimitGb: 500,
-      prismInstancesConfigured: metrics.prismInstancesConfigured === true,
     },
     instances: rows.map((instance) => {
       const status = instance.status as Record<string, unknown>;

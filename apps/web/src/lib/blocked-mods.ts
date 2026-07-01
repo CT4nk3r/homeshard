@@ -5,7 +5,7 @@ export type BlockedMod = {
 };
 
 /**
- * Extract the CurseForge "blocked mods" that Prism could not download from an
+ * Extract the CurseForge "blocked mods" that could not be downloaded automatically from an
  * agent error/reason string. The agent emits, per blocked mod:
  *
  *   Blocked mod: <name>

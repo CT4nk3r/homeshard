@@ -88,7 +88,7 @@ export function CommandActivity({ instanceId }: { instanceId: string }) {
       const body = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(body.error ?? "Could not upload missing mods");
       const uploaded = Array.isArray(body.uploaded) ? body.uploaded.length : files.length;
-      setUploadMessage(`Uploaded ${uploaded} file${uploaded === 1 ? "" : "s"}. Retry deployment once Prism has picked it up.`);
+      setUploadMessage(`Uploaded ${uploaded} file${uploaded === 1 ? "" : "s"}. Retry deployment to use them.`);
     } catch (caught) {
       setUploadMessage(caught instanceof Error ? caught.message : "Could not upload missing mods");
     } finally {
@@ -117,9 +117,9 @@ export function CommandActivity({ instanceId }: { instanceId: string }) {
             <AlertTitle>Manual CurseForge download required</AlertTitle>
             <AlertDescription className="space-y-3">
               <p>
-                Prism cannot download {blockedMods.length === 1 ? "this file" : `these ${blockedMods.length} files`} through
-                third-party launcher APIs. Download {blockedMods.length === 1 ? "it" : "each one"} from CurseForge, then upload
-                the file{blockedMods.length === 1 ? "" : "s"} here so Prism can finish the import.
+                CurseForge blocks automatic download of {blockedMods.length === 1 ? "this file" : `these ${blockedMods.length} files`}
+                because the author disabled third-party downloads. Download {blockedMods.length === 1 ? "it" : "each one"} from CurseForge, then upload
+                the file{blockedMods.length === 1 ? "" : "s"} here so the next deploy can finish.
               </p>
               <ul className="space-y-2">
                 {blockedMods.map((mod) => (
@@ -195,7 +195,7 @@ function describeCommand(command: CommandActivityItem) {
   if (command.status === "succeeded") return command.result?.message ?? `${command.kind} completed.`;
   if (command.status === "queued") return `${command.kind} is queued for the homeserver agent.`;
   if (command.kind === "create_instance" || command.kind === "retry_deploy") {
-    return "The homeserver agent is deploying this instance. CurseForge packs may pause in Prism if a manual-download mod is blocked.";
+    return "The homeserver agent is deploying this instance. CurseForge packs may need a manual mod download if the author blocked automatic downloads.";
   }
   return `${command.kind} is running on the homeserver agent.`;
 }
@@ -210,7 +210,7 @@ function detail(command: CommandActivityItem) {
   if (command.error) return tidyErrorMessage(command.error);
   if (command.result?.message) return tidyErrorMessage(command.result.message);
   if (command.status === "claimed" && (command.kind === "create_instance" || command.kind === "retry_deploy")) {
-    return "Importing/resolving the pack, copying server files, or launching Docker. Check Prism/VNC if this sits here for a while.";
+    return "Importing/resolving the pack, copying server files, or launching Docker. Check the server container logs if this sits here for a while.";
   }
   if (command.status === "queued") return "Waiting for the homeserver agent to claim it.";
   return command.claimedBy ? `Claimed by ${command.claimedBy}.` : "-";

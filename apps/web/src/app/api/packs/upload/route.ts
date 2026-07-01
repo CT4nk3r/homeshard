@@ -11,14 +11,20 @@ export async function POST(request: Request) {
       body,
       onBeforeGenerateToken: async (pathname) => {
         await requireMember();
+        const lower = pathname.toLowerCase();
         if (
           !pathname.startsWith("staging/packs/")
-          || (!pathname.toLowerCase().endsWith(".zip") && !pathname.toLowerCase().endsWith(".mrpack"))
+          || (!lower.endsWith(".zip") && !lower.endsWith(".mrpack") && !lower.endsWith(".json"))
         ) {
           throw new Error("Invalid pack staging path");
         }
         return {
-          allowedContentTypes: ["application/zip", "application/x-zip-compressed", "application/octet-stream"],
+          allowedContentTypes: [
+            "application/zip",
+            "application/x-zip-compressed",
+            "application/octet-stream",
+            "application/json",
+          ],
           maximumSizeInBytes: MAX_PACK_BYTES,
           addRandomSuffix: true,
           allowOverwrite: false,

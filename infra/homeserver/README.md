@@ -51,41 +51,36 @@ the dashboard shows `MAGIC_DNS:port` as the connection address.
 The agent only manages containers it labels with `homeshard.managed` and
 `homeshard.instance_id`; other containers on the host are never touched.
 
-## CurseForge packs through PrismLauncher (optional)
+## CurseForge & Modrinth packs
 
-Modrinth packs and vanilla/Fabric/Forge/NeoForge servers work out of the box.
-**CurseForge** packs are different: many mods are blocked from third-party API
-downloads, so Homeshard resolves them by driving a real
-[PrismLauncher](https://prismlauncher.org) install on the host.
+Modrinth `.mrpack` packs and vanilla/Fabric/Forge/NeoForge servers work out of
+the box. **CurseForge** packs need a CurseForge API key: set `CF_API_KEY` in
+`.env` and the agent imports the pack ZIP headlessly through the itzg
+`AUTO_CURSEFORGE` installer — no PrismLauncher, desktop app, or X display.
 
-To enable it:
+> **Getting a key:** CurseForge issues API keys to approved projects through the
+> [CurseForge developer console](https://console.curseforge.com/). Access is
+> limited, so if you can't get one, use Modrinth packs or the Prism modlist
+> import below instead — neither needs a key.
 
-1. Install PrismLauncher on the host under a dedicated user and complete its
-   first-run setup (accounts, Java). Note that user and its instances directory.
-2. Provide an X display for Prism's GUI (a headless `Xvfb`/VNC display works);
-   set `HOMESHARD_PRISM_DISPLAY` if it isn't `:1`.
-3. In `.env` set:
-   - `HOMESHARD_PRISM_USER` — the OS user that owns the Prism install.
-   - `HOST_PRISM_IMPORT_SCRIPT` — the **absolute host path** to this repo's
-     `prism-import-host.sh` (e.g. `/opt/homeshard/infra/homeserver/prism-import-host.sh`).
-   - `HOST_PRISM_INSTANCES_DIR` — the host PrismLauncher `instances` directory.
-   - `HOST_MISSING_MODS_DIR` — a host folder for manually-downloaded mods; this
-     is also the folder Prism watches for blocked files, so keep the two aligned.
+You can also import a **PrismLauncher modlist JSON export** (`.json`). The agent
+resolves each CurseForge/Modrinth mod through their public APIs and installs
+them, using the server type and Minecraft version chosen in the create form.
 
 ### Blocked mods
 
-Some CurseForge projects forbid third-party downloads. When a pack includes them
-the deploy fails and the dashboard shows a per-mod list with a download link and
-expected SHA-1 for each. Download each file from CurseForge, add it through the
-blocked-mods upload form (`.jar`/`.zip`), then retry the deploy — Prism matches
-the files by hash and continues.
+Some CurseForge projects forbid automated third-party downloads. When a pack
+includes them the deploy pauses and the dashboard shows a per-mod list with a
+download link and expected SHA-1 for each. Download each file from CurseForge,
+add it through the blocked-mods upload form (`.jar`/`.zip`), then retry the
+deploy — the agent picks the files up from `HOST_MISSING_MODS_DIR` and continues.
 
 ## How imports work
 
-`prism-import-container.sh` (mounted into the agent as
-`/usr/local/bin/homeshard-prism-import`) runs a privileged helper container that
-`chroot`s into the host and executes `prism-import-host.sh` as
-`HOMESHARD_PRISM_USER`. That script imports the pack ZIP through Prism, accepts
-the import dialog, waits for the mod jars, and reports any blocked mods. Both the
-agent-side call and the helper have timeouts so a wedged import can never block
-the agent.
+The agent stages the uploaded pack, then launches the itzg
+[`minecraft-server`](https://docker-minecraft-server.readthedocs.io) image with
+the right platform env: `AUTO_CURSEFORGE` + `CF_API_KEY` for CurseForge ZIPs,
+`MODRINTH` for `.mrpack`, or resolved `CURSEFORGE_FILES`/`MODRINTH_PROJECTS` for
+a Prism modlist. It watches the install, re-surfaces any blocked mods, and picks
+the JRE image that matches the pack's Minecraft version. The install has a
+timeout so a stuck download can never block the agent.

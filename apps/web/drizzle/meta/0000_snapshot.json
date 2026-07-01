@@ -338,7 +338,7 @@
           "type": "text",
           "primaryKey": false,
           "notNull": true,
-          "default": "'ct4nk3r-homeserver'"
+          "default": "'homeserver'"
         },
         "agent_id": {
           "name": "agent_id",

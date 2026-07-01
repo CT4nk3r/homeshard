@@ -7,7 +7,6 @@ use std::{
     collections::{BTreeMap, HashSet},
     env,
     path::{Path, PathBuf},
-    process::Stdio,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -30,10 +29,11 @@ struct Settings {
     magic_dns_name: String,
     game_bind_ip: String,
     minecraft_image: String,
+    minecraft_image_modern: String,
     blob_token: Option<String>,
-    prism_instances_root: PathBuf,
-    prism_import_command: Option<String>,
-    prism_import_timeout: Duration,
+    cf_api_key: Option<String>,
+    missing_mods_dir: Option<String>,
+    cf_install_timeout: Duration,
     max_concurrent_commands: usize,
     poll_active_ms: u64,
     poll_idle_ms: u64,
@@ -138,6 +138,17 @@ struct InstanceModFile {
 enum PackPlatform {
     CurseForge,
     Modrinth,
+    PrismModlist,
+}
+
+/// One entry from a PrismLauncher JSON modlist export.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ModlistEntry {
+    #[serde(default)]
+    name: Option<String>,
+    url: String,
+    #[serde(default)]
+    filename: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -188,7 +199,7 @@ async fn main() -> Result<()> {
         }
 
         // Cap how many commands run at once. The claim query already prevents
-        // two commands for the same instance (or two Prism imports) from
+        // two commands for the same instance (or two deploys) from
         // overlapping, so different instances stay fully independent.
         if in_flight.load(Ordering::SeqCst) >= settings.max_concurrent_commands {
             sleep(Duration::from_millis(settings.poll_active_ms)).await;
@@ -265,13 +276,15 @@ impl Settings {
                 .unwrap_or_else(|_| "0.0.0.0".into()),
             minecraft_image: env::var("HOMESHARD_MINECRAFT_IMAGE")
                 .unwrap_or_else(|_| "itzg/minecraft-server:java21".into()),
+            // Newer Minecraft (e.g. 26.x) needs a newer JRE than 1.x packs; the
+            // right image is auto-selected per instance from the pack's MC version.
+            minecraft_image_modern: env::var("HOMESHARD_MINECRAFT_IMAGE_MODERN")
+                .unwrap_or_else(|_| "itzg/minecraft-server:java25".into()),
             blob_token: optional("BLOB_READ_WRITE_TOKEN"),
-            prism_instances_root: env::var("HOMESHARD_PRISM_INSTANCES_ROOT")
-                .unwrap_or_else(|_| "/prism/instances".into())
-                .into(),
-            prism_import_command: optional("HOMESHARD_PRISM_IMPORT_COMMAND"),
-            prism_import_timeout: Duration::from_secs(
-                env::var("HOMESHARD_PRISM_IMPORT_TIMEOUT_SECS")
+            cf_api_key: optional("HOMESHARD_CF_API_KEY").or_else(|| optional("CF_API_KEY")),
+            missing_mods_dir: optional("HOMESHARD_MISSING_MODS_DIR"),
+            cf_install_timeout: Duration::from_secs(
+                env::var("HOMESHARD_CF_INSTALL_TIMEOUT_SECS")
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .filter(|secs| *secs > 0)
@@ -291,6 +304,41 @@ impl Settings {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10_000),
         })
+    }
+
+    /// Pick the server image whose bundled JRE matches the Minecraft version.
+    /// Classic "1.x" versions run on the default (Java 21) image; newer schemes
+    /// (e.g. "26.x") need the modern (Java 25) image.
+    fn image_for_minecraft_version(&self, version: Option<&str>) -> String {
+        pick_minecraft_image(&self.minecraft_image, &self.minecraft_image_modern, version)
+    }
+}
+
+fn pick_minecraft_image(default_image: &str, modern_image: &str, version: Option<&str>) -> String {
+    match version.map(str::trim) {
+        Some(version) if !version.is_empty() && !version.starts_with("1.") => modern_image.to_string(),
+        _ => default_image.to_string(),
+    }
+}
+
+/// The Minecraft version a pack targets, read from its stored manifest.
+fn pack_minecraft_version(pack: &PackArchive) -> Option<String> {
+    match pack.platform {
+        PackPlatform::CurseForge => pack
+            .manifest
+            .get("minecraft")
+            .and_then(|value| value.get("version"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        PackPlatform::Modrinth => pack
+            .manifest
+            .get("dependencies")
+            .and_then(|value| value.get("minecraft"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        // A Prism modlist doesn't carry a version; the caller falls back to the
+        // Minecraft version chosen in the create form.
+        PackPlatform::PrismModlist => None,
     }
 }
 
@@ -332,15 +380,8 @@ async fn collect_host_metrics(settings: &Settings) -> Value {
         "memoryTotalGb": memory.0,
         "memoryUsedGb": memory.1,
         "nvmeFreeGb": nvme_free_gb,
-        "coldUsedGb": cold_used_gb,
-        "prismInstancesConfigured": prism_instances_configured(settings).await
+        "coldUsedGb": cold_used_gb
     })
-}
-
-async fn prism_instances_configured(settings: &Settings) -> bool {
-    tokio::fs::metadata(&settings.prism_instances_root)
-        .await
-        .is_ok_and(|metadata| metadata.is_dir())
 }
 
 fn parse_meminfo(contents: &str) -> Option<(f64, f64)> {
@@ -407,8 +448,8 @@ async fn claim_command(pool: &PgPool, settings: &Settings) -> Result<Option<Clai
                 AND busy.instance_id IS NOT NULL
                 AND busy.instance_id = c.instance_id
             )
-            -- Only one Prism import (create/retry) at a time; they share the
-            -- host Prism launcher. This never blocks other instances' commands.
+            -- Only one deploy (create/retry) at a time, so instance creation
+            -- can't race on slug/port allocation. Never blocks other commands.
             AND NOT (
               c.kind IN ('create_instance', 'retry_deploy')
               AND EXISTS (
@@ -716,7 +757,7 @@ async fn retry_deploy(
 async fn launch_instance(
     settings: &Settings,
     instance_id: Uuid,
-    instance_name: &str,
+    _instance_name: &str,
     port: i32,
     server_type: &str,
     game_version: &str,
@@ -733,7 +774,7 @@ async fn launch_instance(
         "run".into(),
         "-d".into(),
         "--name".into(),
-        container,
+        container.clone(),
         "--label".into(),
         "homeshard.managed=true".into(),
         "--label".into(),
@@ -750,13 +791,27 @@ async fn launch_instance(
     if let Some(seed) = level_seed.map(str::trim).filter(|seed| !seed.is_empty()) {
         args.extend(["-e".into(), format!("SEED={seed}")]);
     }
+    let mut auto_curseforge = false;
     if let Some(pack) = pack {
         match pack.platform {
+            // Install the pack headlessly through the itzg image's CurseForge API
+            // support. No privileged host access, no GUI launcher.
             PackPlatform::CurseForge => {
-                stage_curseforge_pack_from_prism(settings, &data_dir, pack, instance_name).await?;
-                add_curseforge_prism_arguments(&mut args, pack)?;
+                let cf_api_key = settings.cf_api_key.as_deref().ok_or_else(|| {
+                    anyhow!("CurseForge packs require a CurseForge API key; set CF_API_KEY")
+                })?;
+                add_curseforge_auto_arguments(&mut args, settings, pack, cf_api_key);
+                auto_curseforge = true;
             }
             PackPlatform::Modrinth => add_modrinth_pack_arguments(&mut args, pack),
+            // Recreate a PrismLauncher modlist export: resolve each mod to an
+            // exact pinned file and install it headlessly. Loader + MC version
+            // come from the create form (they aren't in the export).
+            PackPlatform::PrismModlist => {
+                add_prism_modlist_arguments(&mut args, settings, pack, server_type, game_version)
+                    .await?;
+                auto_curseforge = true;
+            }
         }
     } else {
         args.extend([
@@ -766,14 +821,18 @@ async fn launch_instance(
             format!("VERSION={game_version}"),
         ]);
     }
-    args.push(settings.minecraft_image.clone());
+    // Match the server image's JRE to the Minecraft version so newer packs (e.g.
+    // 26.x on Java 25) and classic 1.x packs (Java 21) both start cleanly.
+    let mc_version = pack
+        .and_then(pack_minecraft_version)
+        .unwrap_or_else(|| game_version.to_string());
+    args.push(settings.image_for_minecraft_version(Some(&mc_version)));
     docker_owned(&args).await?;
-    Ok(())
-}
-
-fn add_curseforge_prism_arguments(args: &mut Vec<String>, pack: &PackArchive) -> Result<()> {
-    for (name, value) in curseforge_loader_env(&pack.manifest)? {
-        args.extend(["-e".into(), format!("{name}={value}")]);
+    if auto_curseforge {
+        if let Err(error) = await_curseforge_install(settings, &container).await {
+            let _ = docker(["rm", "-f", &container]).await;
+            return Err(error);
+        }
     }
     Ok(())
 }
@@ -789,307 +848,367 @@ fn add_modrinth_pack_arguments(args: &mut Vec<String>, pack: &PackArchive) {
     ]);
 }
 
-fn curseforge_loader_env(manifest: &Value) -> Result<Vec<(String, String)>> {
-    let minecraft = manifest
-        .get("minecraft")
-        .and_then(Value::as_object)
-        .ok_or_else(|| anyhow!("CurseForge manifest is missing minecraft settings"))?;
-    let minecraft_version = minecraft
-        .get("version")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("CurseForge manifest is missing minecraft version"))?;
-    let loader_id = minecraft
-        .get("modLoaders")
-        .and_then(Value::as_array)
-        .and_then(|loaders| {
-            loaders
-                .iter()
-                .find(|loader| loader.get("primary").and_then(Value::as_bool) == Some(true))
-                .or_else(|| loaders.first())
-        })
-        .and_then(|loader| loader.get("id").and_then(Value::as_str))
-        .ok_or_else(|| anyhow!("CurseForge manifest is missing a mod loader"))?;
-    let (loader, loader_version) = loader_id
-        .split_once('-')
-        .ok_or_else(|| anyhow!("unsupported CurseForge mod loader id: {loader_id}"))?;
-    let (server_type, version_env) = match loader.to_ascii_lowercase().as_str() {
-        "forge" => ("FORGE", "FORGE_VERSION"),
-        "fabric" => ("FABRIC", "FABRIC_LOADER_VERSION"),
-        "neoforge" => ("NEOFORGE", "NEOFORGE_VERSION"),
-        other => return Err(anyhow!("unsupported CurseForge mod loader: {other}")),
-    };
-    Ok(vec![
-        ("TYPE".into(), server_type.into()),
-        ("VERSION".into(), minecraft_version.into()),
-        (version_env.into(), loader_version.into()),
-    ])
+fn add_curseforge_auto_arguments(
+    args: &mut Vec<String>,
+    settings: &Settings,
+    pack: &PackArchive,
+    cf_api_key: &str,
+) {
+    args.extend([
+        "-e".into(),
+        "MODPACK_PLATFORM=AUTO_CURSEFORGE".into(),
+        "-e".into(),
+        format!("CF_API_KEY={cf_api_key}"),
+        // Install the uploaded (possibly unpublished) modpack archive directly.
+        "-e".into(),
+        "CF_MODPACK_ZIP=/modpack.zip".into(),
+        // A slug is required alongside CF_MODPACK_ZIP; a placeholder is fine.
+        "-e".into(),
+        "CF_SLUG=homeshard".into(),
+        "-v".into(),
+        format!("{}:/modpack.zip:ro", pack.path.display()),
+    ]);
+    // Let the itzg image pick up manually-downloaded "blocked" mods that the user
+    // uploaded through Homeshard.
+    if let Some(dir) = settings.missing_mods_dir.as_deref() {
+        args.extend(["-v".into(), format!("{dir}:/downloads/mods:ro")]);
+    }
 }
 
-async fn stage_curseforge_pack_from_prism(
+/// Read a PrismLauncher JSON modlist export (a JSON array of mod entries). Returns
+/// None if the file is not such an export (e.g. it's a ZIP pack).
+async fn read_prism_modlist(path: &Path) -> Option<Vec<ModlistEntry>> {
+    let metadata = tokio::fs::metadata(path).await.ok()?;
+    if metadata.len() > 8 * 1024 * 1024 {
+        return None;
+    }
+    let text = tokio::fs::read_to_string(path).await.ok()?;
+    let mods: Vec<ModlistEntry> = serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()?;
+    // Require at least one entry that actually looks like a mod reference.
+    if mods.iter().any(|entry| entry.filename.is_some() && !entry.url.is_empty()) {
+        Some(mods)
+    } else {
+        None
+    }
+}
+
+/// Resolve every mod in a Prism modlist to an exact pinned file and set the itzg
+/// CURSEFORGE_FILES / MODRINTH_PROJECTS environment variables. The mod loader and
+/// Minecraft version come from the create form, not the export.
+async fn add_prism_modlist_arguments(
+    args: &mut Vec<String>,
     settings: &Settings,
-    data_dir: &Path,
     pack: &PackArchive,
-    instance_name: &str,
+    server_type: &str,
+    game_version: &str,
 ) -> Result<()> {
-    let mut imported = false;
-    let mut instance_dir = match find_prism_instance_for_pack(settings, pack, instance_name).await {
-        Ok(path) => path,
-        Err(error) => {
-            import_curseforge_pack_with_prism(settings, pack)
-                .await
-                .with_context(|| {
-                    format!("auto-import Prism instance after match failed: {error}")
-                })?;
-            imported = true;
-            find_prism_instance_for_pack(settings, pack, instance_name).await?
-        }
-    };
-    let mut minecraft_dir = prism_minecraft_dir(&instance_dir).await?;
-    let mods_dir = minecraft_dir.join("mods");
-    if !has_downloaded_mods(&mods_dir).await? {
-        if !imported && settings.prism_import_command.is_some() {
-            import_curseforge_pack_with_prism(settings, pack).await?;
-            instance_dir = find_prism_instance_for_pack(settings, pack, instance_name).await?;
-            minecraft_dir = prism_minecraft_dir(&instance_dir).await?;
-            if !has_downloaded_mods(&minecraft_dir.join("mods")).await? {
-                return Err(anyhow!(
-                    "Prism instance '{}' still has no downloaded mods after auto-import",
-                    instance_dir.display()
-                ));
-            }
-        } else {
-            return Err(anyhow!(
-                "Prism instance '{}' has no downloaded mods; import the pack in Prism before deploying",
-                instance_dir.display()
-            ));
+    let cf_api_key = settings
+        .cf_api_key
+        .clone()
+        .ok_or_else(|| anyhow!("Prism modlists with CurseForge mods require a CurseForge API key; set CF_API_KEY"))?;
+    let mods: Vec<ModlistEntry> = pack
+        .manifest
+        .get("homeshardModlist")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()?
+        .ok_or_else(|| anyhow!("stored Prism modlist is missing its mod entries"))?;
+
+    let mut set = tokio::task::JoinSet::new();
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(10));
+    for entry in mods {
+        let cf_api_key = cf_api_key.clone();
+        let semaphore = semaphore.clone();
+        set.spawn(async move {
+            let _permit = semaphore.acquire_owned().await.ok();
+            resolve_modlist_entry(&cf_api_key, &entry).await
+        });
+    }
+
+    let mut cf_refs = Vec::new();
+    let mut mr_refs = Vec::new();
+    let mut unresolved = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        match joined? {
+            Ok(ResolvedMod::CurseForge(reference)) => cf_refs.push(reference),
+            Ok(ResolvedMod::Modrinth(reference)) => mr_refs.push(reference),
+            Ok(ResolvedMod::Skipped) => {}
+            Err(label) => unresolved.push(label),
         }
     }
 
-    let source = format!("{}/.", minecraft_dir.display());
-    let target = data_dir.display().to_string();
-    run_command("cp", &["-a", &source, &target])
-        .await
-        .with_context(|| {
-            format!(
-                "copy Prism instance files from '{}' into '{}'",
-                minecraft_dir.display(),
-                data_dir.display()
-            )
-        })?;
-    let disabled = disable_default_server_mods(data_dir).await?;
-    if !disabled.is_empty() {
-        info!(
-            disabled_mods = %disabled.join(", "),
-            "moved default-disabled server mods to mods_disabled"
+    if !unresolved.is_empty() {
+        unresolved.sort();
+        return Err(anyhow!(
+            "Could not resolve {} mod(s) from the Prism modlist: {}",
+            unresolved.len(),
+            unresolved.join("; ")
+        ));
+    }
+
+    args.extend([
+        "-e".into(),
+        format!("TYPE={server_type}"),
+        "-e".into(),
+        format!("VERSION={game_version}"),
+        "-e".into(),
+        format!("CF_API_KEY={cf_api_key}"),
+    ]);
+    if !cf_refs.is_empty() {
+        args.extend(["-e".into(), format!("CURSEFORGE_FILES={}", cf_refs.join(","))]);
+    }
+    if !mr_refs.is_empty() {
+        args.extend(["-e".into(), format!("MODRINTH_PROJECTS={}", mr_refs.join(","))]);
+    }
+    if let Some(dir) = settings.missing_mods_dir.as_deref() {
+        args.extend(["-v".into(), format!("{dir}:/downloads/mods:ro")]);
+    }
+    Ok(())
+}
+
+enum ResolvedMod {
+    CurseForge(String),
+    Modrinth(String),
+    /// The mod was disabled in Prism (filename ends in .disabled); skip it.
+    Skipped,
+}
+
+/// Resolve one modlist entry to a pinned itzg reference, or Err(label) naming the
+/// mod that could not be resolved.
+async fn resolve_modlist_entry(
+    cf_api_key: &str,
+    entry: &ModlistEntry,
+) -> std::result::Result<ResolvedMod, String> {
+    let label = entry
+        .name
+        .clone()
+        .or_else(|| entry.filename.clone())
+        .unwrap_or_else(|| entry.url.clone());
+    let filename = match entry.filename.as_deref() {
+        Some(filename) if !filename.is_empty() => filename,
+        _ => return Err(format!("{label} (no filename in export)")),
+    };
+    // PrismLauncher appends ".disabled" to mods the user turned off; honor that by
+    // leaving them out of the server.
+    let filename = match filename.strip_suffix(".disabled") {
+        Some(_) => return Ok(ResolvedMod::Skipped),
+        None => filename,
+    };
+
+    if let Some(project_id) = curseforge_project_id(&entry.url) {
+        match resolve_curseforge_file_id(cf_api_key, project_id, filename).await {
+            Ok(file_id) => Ok(ResolvedMod::CurseForge(format!("{project_id}:{file_id}"))),
+            Err(error) => Err(format!("{label} ({error})")),
+        }
+    } else if let Some(slug) = modrinth_slug(&entry.url) {
+        match resolve_modrinth_version(&slug, filename).await {
+            Ok(version_id) => Ok(ResolvedMod::Modrinth(format!("{slug}:{version_id}"))),
+            Err(error) => Err(format!("{label} ({error})")),
+        }
+    } else {
+        Err(format!("{label} (unrecognized url: {})", entry.url))
+    }
+}
+
+fn curseforge_project_id(url: &str) -> Option<u64> {
+    let rest = url.split("curseforge.com/projects/").nth(1)?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+fn modrinth_slug(url: &str) -> Option<String> {
+    let rest = url.split("modrinth.com/").nth(1)?;
+    let slug = rest.rsplit('/').next()?.split(['?', '#']).next()?;
+    if slug.is_empty() {
+        None
+    } else {
+        Some(slug.to_string())
+    }
+}
+
+async fn resolve_curseforge_file_id(
+    cf_api_key: &str,
+    project_id: u64,
+    filename: &str,
+) -> std::result::Result<i64, String> {
+    for index in (0..1000).step_by(50) {
+        let url = format!(
+            "https://api.curseforge.com/v1/mods/{project_id}/files?pageSize=50&index={index}"
         );
-    }
-    Ok(())
-}
-
-async fn import_curseforge_pack_with_prism(settings: &Settings, pack: &PackArchive) -> Result<()> {
-    let command = settings.prism_import_command.as_deref().ok_or_else(|| {
-        anyhow!(
-            "No Prism instance matching '{}' was found and HOMESHARD_PRISM_IMPORT_COMMAND is not configured",
-            pack.sha256
-        )
-    })?;
-    let pack_path = pack.path.display().to_string();
-    let output = run_command_with_timeout(
-        command,
-        &[&pack_path, &pack.sha256, &pack.original_name],
-        settings.prism_import_timeout,
-    )
-    .await
-    .with_context(|| format!("run Prism auto-import for '{}'", pack.original_name))?;
-    info!(pack = %pack.original_name, output = %output, "Prism auto-import completed");
-    Ok(())
-}
-
-#[derive(Debug)]
-struct PrismCandidate {
-    path: PathBuf,
-    name: String,
-    score: i32,
-}
-
-async fn find_prism_instance_for_pack(
-    settings: &Settings,
-    pack: &PackArchive,
-    instance_name: &str,
-) -> Result<PathBuf> {
-    let expected_names = expected_pack_names(pack, instance_name);
-    let expected_slugs = expected_names
-        .iter()
-        .map(|name| slugify(name))
-        .filter(|name| !name.is_empty())
-        .collect::<Vec<_>>();
-    if expected_names.is_empty() || expected_slugs.is_empty() {
-        return Err(anyhow!("CurseForge pack is missing a usable pack name"));
-    }
-    let root = &settings.prism_instances_root;
-    let metadata = tokio::fs::metadata(root).await.with_context(|| {
-        format!(
-            "Prism instances directory '{}' is not available",
-            root.display()
-        )
-    })?;
-    if !metadata.is_dir() {
-        return Err(anyhow!(
-            "Prism instances path '{}' is not a directory",
-            root.display()
-        ));
-    }
-
-    let mut entries = tokio::fs::read_dir(root).await?;
-    let mut candidates = Vec::new();
-    while let Some(entry) = entries.next_entry().await? {
-        if !entry.file_type().await?.is_dir() {
-            continue;
-        }
-        let path = entry.path();
-        if prism_minecraft_dir(&path).await.is_err() {
-            continue;
-        }
-        let mut names = Vec::new();
-        if let Some(name) = read_prism_instance_name(&path).await {
-            names.push(name);
-        }
-        if let Some(name) = path.file_name().and_then(|value| value.to_str()) {
-            names.push(name.to_string());
-        }
-        let score = prism_candidate_score(&names, &expected_slugs);
-        if score > 0 {
-            let name = names
-                .first()
-                .cloned()
-                .unwrap_or_else(|| path.display().to_string());
-            candidates.push(PrismCandidate { path, name, score });
-        }
-    }
-
-    candidates.sort_by(|left, right| {
-        right
-            .score
-            .cmp(&left.score)
-            .then_with(|| left.name.cmp(&right.name))
-    });
-    let Some(best) = candidates.first() else {
-        return Err(anyhow!(
-            "No Prism instance matching '{}' was found under '{}'; import the pack in Prism using one of those names first",
-            expected_names.join("' or '"),
-            root.display()
-        ));
-    };
-    if candidates
-        .get(1)
-        .is_some_and(|candidate| candidate.score == best.score)
-    {
-        let names = candidates
-            .iter()
-            .filter(|candidate| candidate.score == best.score)
-            .map(|candidate| candidate.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(anyhow!(
-            "Multiple Prism instances match '{}': {names}; rename one or remove the stale import",
-            expected_names.join("' or '")
-        ));
-    }
-
-    Ok(best.path.clone())
-}
-
-fn expected_pack_names(pack: &PackArchive, instance_name: &str) -> Vec<String> {
-    let mut values = Vec::new();
-    if !instance_name.trim().is_empty() {
-        values.push(instance_name.trim().to_string());
-    }
-    if let Some(name) = pack.manifest.get("name").and_then(Value::as_str) {
-        values.push(name.to_string());
-    }
-    if let Some(stem) = Path::new(&pack.original_name)
-        .file_stem()
-        .and_then(|value| value.to_str())
-    {
-        values.push(stem.to_string());
-    }
-    if !pack.sha256.trim().is_empty() {
-        values.push(pack.sha256.clone());
-    }
-    values.sort_by_key(|value| value.to_ascii_lowercase());
-    values.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
-    values
-}
-
-async fn prism_minecraft_dir(instance_dir: &Path) -> Result<PathBuf> {
-    for name in [".minecraft", "minecraft"] {
-        let candidate = instance_dir.join(name);
-        if tokio::fs::metadata(&candidate)
+        let body = curl_json(&url, &["-H", &format!("x-api-key: {cf_api_key}")])
             .await
-            .is_ok_and(|metadata| metadata.is_dir())
-        {
-            return Ok(candidate);
-        }
-    }
-    Err(anyhow!(
-        "Prism instance '{}' has no Minecraft data directory",
-        instance_dir.display()
-    ))
-}
-
-fn prism_candidate_score(names: &[String], expected_slugs: &[String]) -> i32 {
-    let mut score = 0;
-    for name in names {
-        let candidate = slugify(name);
-        for expected in expected_slugs {
-            if candidate == *expected {
-                score = score.max(100);
-            } else if candidate.contains(expected) || expected.contains(&candidate) {
-                score = score.max(50);
+            .map_err(|error| error.to_string())?;
+        let files = body.get("data").and_then(Value::as_array).cloned().unwrap_or_default();
+        for file in &files {
+            if file.get("fileName").and_then(Value::as_str) == Some(filename) {
+                return file
+                    .get("id")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| "malformed file id".to_string());
             }
         }
+        if files.len() < 50 {
+            break;
+        }
     }
-    score
+    Err("file not found on CurseForge".to_string())
 }
 
-async fn read_prism_instance_name(path: &Path) -> Option<String> {
-    for file in ["instance.cfg", "prismlauncher.cfg"] {
-        let Ok(contents) = tokio::fs::read_to_string(path.join(file)).await else {
+async fn resolve_modrinth_version(
+    slug: &str,
+    filename: &str,
+) -> std::result::Result<String, String> {
+    let url = format!("https://api.modrinth.com/v2/project/{slug}/version");
+    let body = curl_json(&url, &[]).await.map_err(|error| error.to_string())?;
+    let versions = body.as_array().ok_or_else(|| "malformed Modrinth response".to_string())?;
+    for version in versions {
+        let Some(files) = version.get("files").and_then(Value::as_array) else {
             continue;
         };
-        for line in contents.lines() {
-            let Some((key, value)) = line.trim().split_once('=') else {
-                continue;
-            };
-            if key.trim().eq_ignore_ascii_case("name") {
-                let name = value.trim();
-                if !name.is_empty() {
-                    return Some(name.to_string());
-                }
-            }
+        if files
+            .iter()
+            .any(|file| file.get("filename").and_then(Value::as_str) == Some(filename))
+        {
+            return version
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| "malformed version id".to_string());
         }
     }
-    None
+    Err("version not found on Modrinth".to_string())
 }
 
-async fn has_downloaded_mods(mods_dir: &Path) -> Result<bool> {
-    let mut entries = match tokio::fs::read_dir(mods_dir).await {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error.into()),
-    };
-    while let Some(entry) = entries.next_entry().await? {
-        if entry.file_type().await?.is_file()
-            && entry
-                .path()
-                .extension()
-                .and_then(|value| value.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("jar"))
+async fn curl_json(url: &str, extra: &[&str]) -> Result<Value> {
+    let mut params = vec![
+        "--fail",
+        "--silent",
+        "--show-error",
+        "--location",
+        "--max-time",
+        "30",
+        "-H",
+        "Accept: application/json",
+        "-H",
+        "User-Agent: homeshard-agent",
+    ];
+    params.extend_from_slice(extra);
+    params.push(url);
+    let output = run_command("curl", &params).await?;
+    serde_json::from_str(&output).with_context(|| format!("parse JSON from {url}"))
+}
+
+/// Surfaces blocked-mod downloads in Homeshard's standard format and is bounded
+/// so a stuck install can never block the agent forever.
+async fn await_curseforge_install(settings: &Settings, container: &str) -> Result<()> {
+    let deadline = Instant::now() + settings.cf_install_timeout;
+    loop {
+        let logs = container_logs(container, 800).await.unwrap_or_default();
+        if let Some(message) = blocked_mods_from_cf_logs(&logs) {
+            return Err(anyhow!("{message}"));
+        }
+        if curseforge_server_ready(&logs) {
+            return Ok(());
+        }
+        let (running, exit_code) = container_state(container).await?;
+        if !running {
+            let tail = logs
+                .lines()
+                .rev()
+                .take(20)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(anyhow!(
+                "CurseForge install failed (server container exited with code {exit_code}). Recent output:\n{tail}"
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(anyhow!(
+                "CurseForge install timed out after {}s",
+                settings.cf_install_timeout.as_secs()
+            ));
+        }
+        sleep(Duration::from_secs(3)).await;
+    }
+}
+
+fn curseforge_server_ready(logs: &str) -> bool {
+    logs.contains("RCON running on") || logs.contains("For help, type") || logs.contains("Done (")
+}
+
+/// Best-effort detection of CurseForge mods that must be downloaded manually,
+/// reformatted into the `Blocked mod:` / `Download:` shape the dashboard parses.
+fn blocked_mods_from_cf_logs(logs: &str) -> Option<String> {
+    let lower = logs.to_lowercase();
+    let manual_needed = lower.contains("manually download")
+        || lower.contains("mods need download")
+        || lower.contains("must be downloaded manually")
+        || lower.contains("need to be downloaded manually")
+        || lower.contains("manual download");
+    if !manual_needed {
+        return None;
+    }
+    let mut seen = HashSet::new();
+    let mut mods: Vec<(String, String)> = Vec::new();
+    for raw in logs.split(|c: char| {
+        c.is_whitespace() || matches!(c, '(' | ')' | '"' | '\'' | ',' | '<' | '>')
+    }) {
+        let url = raw.trim_end_matches(|c: char| matches!(c, '.' | ',' | ')' | ']' | '>' | ':'));
+        if (url.starts_with("https://www.curseforge.com/") || url.starts_with("https://curseforge.com/"))
+            && seen.insert(url.to_string())
         {
-            return Ok(true);
+            mods.push((cf_name_from_url(url), url.to_string()));
         }
     }
-    Ok(false)
+    if mods.is_empty() {
+        return None;
+    }
+    let mut message =
+        String::from("Manual CurseForge download(s) required before this pack can install.\n");
+    for (name, url) in &mods {
+        message.push_str(&format!("Blocked mod: {name}\nDownload: {url}\n"));
+    }
+    message.push_str("Download each file from CurseForge, add it through Homeshard, then retry deploy.");
+    Some(message)
+}
+
+fn cf_name_from_url(url: &str) -> String {
+    url.split('/')
+        .filter(|segment| !segment.is_empty())
+        .rev()
+        .find(|segment| {
+            *segment != "download"
+                && *segment != "files"
+                && !segment.chars().all(|c| c.is_ascii_digit())
+        })
+        .map(|segment| segment.replace('-', " "))
+        .unwrap_or_else(|| url.to_string())
+}
+
+async fn container_state(container: &str) -> Result<(bool, i64)> {
+    let output = run_command(
+        "docker",
+        &["inspect", "-f", "{{.State.Running}} {{.State.ExitCode}}", container],
+    )
+    .await?;
+    let mut parts = output.split_whitespace();
+    let running = parts.next() == Some("true");
+    let exit_code = parts.next().and_then(|value| value.parse().ok()).unwrap_or(0);
+    Ok((running, exit_code))
+}
+
+async fn container_logs(container: &str, lines: u32) -> Result<String> {
+    let output = Command::new("docker")
+        .args(["logs", "--tail", &lines.to_string(), container])
+        .output()
+        .await
+        .with_context(|| format!("read logs for container {container}"))?;
+    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    Ok(combined)
 }
 
 async fn sync_instance_mods(
@@ -1463,27 +1582,6 @@ async fn persist_instance_mods(
     Ok(())
 }
 
-async fn disable_default_server_mods(data_dir: &Path) -> Result<Vec<String>> {
-    let mods_dir = data_dir.join("mods");
-    let disabled_dir = data_dir.join("mods_disabled");
-    let mut moved = Vec::new();
-    for mod_file in scan_mod_dir(&mods_dir, true).await? {
-        if default_disabled_server_mod(&mod_file.filename)
-            && move_mod_file(&mods_dir, &disabled_dir, &mod_file.filename).await?
-        {
-            moved.push(mod_file.filename);
-        }
-    }
-    Ok(moved)
-}
-
-fn default_disabled_server_mod(filename: &str) -> bool {
-    let filename = filename.to_ascii_lowercase();
-    ["configured-", "catalogue-", "controlling-"]
-        .iter()
-        .any(|prefix| filename.starts_with(prefix))
-}
-
 async fn move_mod_file(source_dir: &Path, target_dir: &Path, filename: &str) -> Result<bool> {
     let filename = sanitize_mod_filename(filename)?;
     let source = source_dir.join(&filename);
@@ -1595,7 +1693,11 @@ async fn ingest_pack(
         return Err(anyhow!("staged pack checksum does not match"));
     }
     let (manifest, platform) = inspect_pack_archive(&temporary).await?;
-    let archive = pack_dir.join(format!("{digest}.zip"));
+    let extension = match platform {
+        PackPlatform::PrismModlist => "json",
+        _ => "zip",
+    };
+    let archive = pack_dir.join(format!("{digest}.{extension}"));
     tokio::fs::rename(&temporary, &archive).await?;
     if let Some(path) = remove_after {
         tokio::fs::remove_file(path).await?;
@@ -1611,6 +1713,11 @@ async fn ingest_pack(
 }
 
 async fn inspect_pack_archive(path: &PathBuf) -> Result<(Value, PackPlatform)> {
+    // A PrismLauncher JSON modlist export is a plain JSON array, not a ZIP.
+    if let Some(mods) = read_prism_modlist(path).await {
+        return Ok((json!({ "homeshardModlist": mods }), PackPlatform::PrismModlist));
+    }
+
     let archive = path.display().to_string();
     if let Ok(text) = run_command("unzip", &["-p", &archive, "manifest.json"]).await {
         let manifest: Value =
@@ -1636,6 +1743,9 @@ async fn inspect_pack_archive(path: &PathBuf) -> Result<(Value, PackPlatform)> {
 }
 
 fn pack_platform(manifest: &Value) -> Result<PackPlatform> {
+    if manifest.get("homeshardModlist").is_some() {
+        return Ok(PackPlatform::PrismModlist);
+    }
     if manifest.get("manifestType").and_then(Value::as_str) == Some("minecraftModpack") {
         return Ok(PackPlatform::CurseForge);
     }
@@ -1865,41 +1975,6 @@ async fn run_command(program: &str, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Like [`run_command`], but aborts (and SIGKILLs the child via `kill_on_drop`)
-/// if it does not finish within `timeout`. Used for the Prism auto-import, which
-/// drives a GUI and can wedge indefinitely; without this the serial agent loop
-/// would never claim any further commands.
-async fn run_command_with_timeout(
-    program: &str,
-    args: &[&str],
-    timeout: Duration,
-) -> Result<String> {
-    let child = Command::new(program)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| format!("launch {program} command"))?;
-
-    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(result) => result.with_context(|| format!("wait for {program} command"))?,
-        Err(_) => {
-            return Err(anyhow!(
-                "{program} timed out after {}s",
-                timeout.as_secs()
-            ))
-        }
-    };
-    if !output.status.success() {
-        return Err(anyhow!(
-            "{program} failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
 async fn allocate_port(pool: &PgPool) -> Result<i32> {
     let row = sqlx::query(
         r#"
@@ -1963,8 +2038,47 @@ async fn sha256_file(path: &PathBuf) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{curseforge_loader_env, parse_meminfo, prism_candidate_score, slugify};
-    use serde_json::json;
+    use super::{
+        blocked_mods_from_cf_logs, cf_name_from_url, curseforge_project_id, curseforge_server_ready,
+        modrinth_slug, parse_meminfo, pick_minecraft_image, slugify,
+    };
+
+    #[test]
+    fn parses_curseforge_project_id_from_export_url() {
+        assert_eq!(
+            curseforge_project_id("https://www.curseforge.com/projects/1191517"),
+            Some(1191517)
+        );
+        assert_eq!(curseforge_project_id("https://modrinth.com/mod/tagwiZkJ"), None);
+        assert_eq!(
+            curseforge_project_id("https://www.curseforge.com/minecraft/mc-mods/jei"),
+            None
+        );
+    }
+
+    #[test]
+    fn parses_modrinth_slug_from_export_url() {
+        assert_eq!(
+            modrinth_slug("https://modrinth.com/mod/tagwiZkJ"),
+            Some("tagwiZkJ".to_string())
+        );
+        assert_eq!(
+            modrinth_slug("https://modrinth.com/mod/sodium?foo=1"),
+            Some("sodium".to_string())
+        );
+        assert_eq!(modrinth_slug("https://www.curseforge.com/projects/123"), None);
+    }
+
+    #[test]
+    fn selects_java_image_by_minecraft_version() {
+        let default_image = "itzg/minecraft-server:java21";
+        let modern_image = "itzg/minecraft-server:java25";
+        assert_eq!(pick_minecraft_image(default_image, modern_image, Some("1.21.1")), default_image);
+        assert_eq!(pick_minecraft_image(default_image, modern_image, Some("1.20.4")), default_image);
+        assert_eq!(pick_minecraft_image(default_image, modern_image, Some("26.1.2")), modern_image);
+        assert_eq!(pick_minecraft_image(default_image, modern_image, Some(" ")), default_image);
+        assert_eq!(pick_minecraft_image(default_image, modern_image, None), default_image);
+    }
 
     #[test]
     fn slugifies_names() {
@@ -1980,52 +2094,46 @@ mod tests {
     }
 
     #[test]
-    fn builds_curseforge_loader_environment() {
-        let manifest = json!({
-            "minecraft": {
-                "version": "1.20.1",
-                "modLoaders": [{ "id": "forge-47.2.20", "primary": true }]
-            }
-        });
+    fn cf_name_from_url_extracts_readable_name() {
         assert_eq!(
-            curseforge_loader_env(&manifest).unwrap(),
-            vec![
-                ("TYPE".into(), "FORGE".into()),
-                ("VERSION".into(), "1.20.1".into()),
-                ("FORGE_VERSION".into(), "47.2.20".into()),
-            ]
+            cf_name_from_url(
+                "https://www.curseforge.com/minecraft/mc-mods/custom-nether-portals/download/8267193"
+            ),
+            "custom nether portals"
         );
-
-        let manifest = json!({
-            "minecraft": {
-                "version": "1.21.1",
-                "modLoaders": [{ "id": "fabric-0.16.10", "primary": true }]
-            }
-        });
         assert_eq!(
-            curseforge_loader_env(&manifest).unwrap(),
-            vec![
-                ("TYPE".into(), "FABRIC".into()),
-                ("VERSION".into(), "1.21.1".into()),
-                ("FABRIC_LOADER_VERSION".into(), "0.16.10".into()),
-            ]
+            cf_name_from_url(
+                "https://www.curseforge.com/minecraft/texture-packs/immersive-interfaces/download/8190061"
+            ),
+            "immersive interfaces"
         );
     }
 
     #[test]
-    fn scores_prism_instance_names() {
-        let expected = vec![slugify("Better MC [FORGE]")];
-        assert_eq!(
-            prism_candidate_score(&["Better MC [FORGE]".into()], &expected),
-            100
-        );
-        assert_eq!(
-            prism_candidate_score(&["Better MC [FORGE] - server copy".into()], &expected),
-            50
-        );
-        assert_eq!(
-            prism_candidate_score(&["Unrelated Pack".into()], &expected),
-            0
-        );
+    fn blocked_mods_from_cf_logs_parses_manual_downloads() {
+        let logs = "\
+[mc-image-helper] Some mods need to be downloaded manually:
+  Custom Nether Portals https://www.curseforge.com/minecraft/mc-mods/custom-nether-portals/download/8267193
+  Immersive Interfaces (https://www.curseforge.com/minecraft/texture-packs/immersive-interfaces/download/8190061)
+";
+        let message = blocked_mods_from_cf_logs(logs).expect("should detect blocked mods");
+        assert_eq!(message.matches("Blocked mod:").count(), 2);
+        assert!(message.contains(
+            "Download: https://www.curseforge.com/minecraft/mc-mods/custom-nether-portals/download/8267193"
+        ));
+        assert!(message.contains("Blocked mod: immersive interfaces"));
+    }
+
+    #[test]
+    fn blocked_mods_from_cf_logs_ignores_normal_output() {
+        let logs = "[init] Starting the Minecraft server\nDone (12.3s)! For help, type \"help\"";
+        assert!(blocked_mods_from_cf_logs(logs).is_none());
+    }
+
+    #[test]
+    fn curseforge_server_ready_detects_startup() {
+        assert!(curseforge_server_ready("Done (12.3s)! For help, type \"help\""));
+        assert!(curseforge_server_ready("[15:00:00] [Server thread]: RCON running on 0.0.0.0:25575"));
+        assert!(!curseforge_server_ready("Downloading mods (12/175)"));
     }
 }
