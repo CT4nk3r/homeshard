@@ -1,0 +1,126 @@
+name: homeshard
+
+# Homeshard — self-hostable, Minecraft-first game-server manager.
+#
+# Quick start:
+#   cp .env.example .env      # then edit .env
+#   docker compose up -d --build                    # dashboard + database
+#   docker compose --profile agent up -d --build    # also run the homeserver agent
+#
+# IMPORTANT — identity mounts: the agent launches game containers through the
+# host Docker socket and hands the host-side Prism importer real host paths, so
+# the live-instance and cold-storage directories are bind-mounted at the SAME
+# path inside the agent as on the host. Never remap only one side of those two.
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-homeshard}
+      POSTGRES_USER: ${POSTGRES_USER:-homeshard}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-homeshard}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-homeshard} -d ${POSTGRES_DB:-homeshard}"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    volumes:
+      - homeshard-db:/var/lib/postgresql/data
+
+  # Applies every apps/web/drizzle/*.sql migration on a fresh database and is a
+  # no-op once the schema exists.
+  migrate:
+    image: postgres:17-alpine
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-homeshard}
+    command:
+      - sh
+      - -c
+      - >-
+        until psql -h postgres -U ${POSTGRES_USER:-homeshard} -d ${POSTGRES_DB:-homeshard} -tAc "select 1" >/dev/null 2>&1; do sleep 1; done;
+        if psql -h postgres -U ${POSTGRES_USER:-homeshard} -d ${POSTGRES_DB:-homeshard} -tAc "select to_regclass('public.users')" | grep -q users;
+        then echo "schema already present, skipping migrations";
+        else for f in $$(ls /migrations/*.sql | sort); do echo "applying $$f"; psql -v ON_ERROR_STOP=1 -h postgres -U ${POSTGRES_USER:-homeshard} -d ${POSTGRES_DB:-homeshard} -f "$$f"; done;
+        fi
+    volumes:
+      - ../../apps/web/drizzle:/migrations:ro
+
+  web:
+    build:
+      context: ../..
+      dockerfile: apps/web/Dockerfile
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-homeshard}:${POSTGRES_PASSWORD:-homeshard}@postgres:5432/${POSTGRES_DB:-homeshard}
+      DATABASE_DRIVER: postgresjs
+      # The owner account. Without Clerk keys the dashboard runs in single-owner
+      # demo mode using this identity.
+      OWNER_EMAIL: ${OWNER_EMAIL:-owner@example.com}
+      # Shared secret the agent uses to post events to the web API (optional).
+      AGENT_TOKEN: ${AGENT_TOKEN:-}
+      # Optional Clerk auth for multi-user access.
+      NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY:-}
+      CLERK_SECRET_KEY: ${CLERK_SECRET_KEY:-}
+      # Optional Vercel Blob token for cloud pack staging.
+      BLOB_READ_WRITE_TOKEN: ${BLOB_READ_WRITE_TOKEN:-}
+      HOMESHARD_LOCAL_STAGING_DIR: /staging
+      HOMESHARD_MISSING_MODS_DIR: /missing-mods
+    ports:
+      - "${WEB_PORT:-8010}:3000"
+    volumes:
+      - ${HOST_STAGING_DIR:-./data/staging}:/staging
+      - ${HOST_MISSING_MODS_DIR:-./data/missing-mods}:/missing-mods
+
+  agent:
+    profiles: ["agent"]
+    build:
+      context: ../..
+      dockerfile: crates/agent/Dockerfile
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-homeshard}:${POSTGRES_PASSWORD:-homeshard}@postgres:5432/${POSTGRES_DB:-homeshard}
+      HOMESHARD_AGENT_ID: ${HOMESHARD_AGENT_ID:-homeserver}
+      # Hostname/IP players use to connect (e.g. a Tailscale MagicDNS name).
+      # Shown in the dashboard; leave blank to display a placeholder.
+      HOMESHARD_MAGIC_DNS: ${HOMESHARD_MAGIC_DNS:-}
+      # IP that game container ports bind to on the host. Use your Tailscale IP
+      # to keep servers private, or 0.0.0.0 to expose on all interfaces.
+      HOMESHARD_GAME_BIND_IP: ${HOMESHARD_GAME_BIND_IP:-0.0.0.0}
+      HOMESHARD_MINECRAFT_IMAGE: ${HOMESHARD_MINECRAFT_IMAGE:-itzg/minecraft-server:java21}
+      # Identity-mounted host directories (see IMPORTANT note above).
+      HOMESHARD_ACTIVE_ROOT: ${HOST_INSTANCES_DIR:-/srv/homeshard/instances}
+      HOMESHARD_COLD_ROOT: ${HOST_COLD_DIR:-/srv/homeshard/cold}
+      HOMESHARD_STAGING_ROOT: /staging
+      HOMESHARD_MAX_CONCURRENT_COMMANDS: ${HOMESHARD_MAX_CONCURRENT_COMMANDS:-6}
+      # --- Minecraft CurseForge (Prism) import support (optional) ---
+      HOMESHARD_PRISM_INSTANCES_ROOT: /prism/instances
+      HOMESHARD_PRISM_IMPORT_COMMAND: /usr/local/bin/homeshard-prism-import
+      HOMESHARD_PRISM_HOST_IMPORT_SCRIPT: ${HOST_PRISM_IMPORT_SCRIPT:-}
+      HOMESHARD_PRISM_USER: ${HOMESHARD_PRISM_USER:-}
+      HOMESHARD_PRISM_DISPLAY: ${HOMESHARD_PRISM_DISPLAY:-}
+      HOMESHARD_PRISM_MISSING_MODS_DIR: ${HOST_MISSING_MODS_DIR:-./data/missing-mods}
+      BLOB_READ_WRITE_TOKEN: ${BLOB_READ_WRITE_TOKEN:-}
+      RUST_LOG: homeshard_agent=info
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Identity mounts (host path == container path) — required.
+      - ${HOST_INSTANCES_DIR:-/srv/homeshard/instances}:${HOST_INSTANCES_DIR:-/srv/homeshard/instances}
+      - ${HOST_COLD_DIR:-/srv/homeshard/cold}:${HOST_COLD_DIR:-/srv/homeshard/cold}
+      - ${HOST_STAGING_DIR:-./data/staging}:/staging
+      # Minecraft/CurseForge only: read-only PrismLauncher instances directory.
+      - ${HOST_PRISM_INSTANCES_DIR:-./data/prism-instances}:/prism/instances:ro
+      - ./prism-import-container.sh:/usr/local/bin/homeshard-prism-import:ro
+
+volumes:
+  homeshard-db:

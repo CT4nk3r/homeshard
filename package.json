@@ -1,0 +1,16 @@
+{
+  "name": "homeshard",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@10.28.0",
+  "license": "AGPL-3.0-only",
+  "scripts": {
+    "dev": "pnpm --dir apps/web dev",
+    "build": "pnpm --dir apps/web build",
+    "lint": "pnpm --dir apps/web lint",
+    "db:generate": "pnpm --dir apps/web db:generate",
+    "db:push": "pnpm --dir apps/web db:push",
+    "agent:check": "cargo check --manifest-path crates/agent/Cargo.toml",
+    "agent:test": "cargo test --manifest-path crates/agent/Cargo.toml"
+  }
+}
