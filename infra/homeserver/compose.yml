@@ -73,11 +73,17 @@ services:
       BLOB_READ_WRITE_TOKEN: ${BLOB_READ_WRITE_TOKEN:-}
       HOMESHARD_LOCAL_STAGING_DIR: /staging
       HOMESHARD_MISSING_MODS_DIR: /missing-mods
+      # Read-only access to the agent's instance + cold-storage dirs (identity
+      # mounts) so the dashboard can serve pack files and stream mod jars.
+      HOMESHARD_ACTIVE_ROOT: ${HOST_INSTANCES_DIR:-/srv/homeshard/instances}
+      HOMESHARD_COLD_ROOT: ${HOST_COLD_DIR:-/srv/homeshard/cold}
     ports:
       - "${WEB_PORT:-8010}:3000"
     volumes:
       - ${HOST_STAGING_DIR:-./data/staging}:/staging
       - ${HOST_MISSING_MODS_DIR:-/srv/homeshard/missing-mods}:/missing-mods
+      - ${HOST_INSTANCES_DIR:-/srv/homeshard/instances}:${HOST_INSTANCES_DIR:-/srv/homeshard/instances}:ro
+      - ${HOST_COLD_DIR:-/srv/homeshard/cold}:${HOST_COLD_DIR:-/srv/homeshard/cold}:ro
 
   agent:
     profiles: ["agent"]

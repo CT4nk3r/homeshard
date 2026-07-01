@@ -2,7 +2,7 @@
 
 import { type DragEvent, type FormEvent, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Link, Loader2, Plus, RefreshCw, Save, Upload } from "lucide-react";
+import { Download, Link, Loader2, Plus, RefreshCw, Save, Upload } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -196,6 +196,13 @@ export function ModManager({ instanceId, mods, state }: { instanceId: string; mo
           <Button variant="outline" disabled={Boolean(pending) || state === "trashed"} onClick={() => setAddOpen(true)}>
             <Plus className="size-4" />Add new mod
           </Button>
+          {mods.length ? (
+            <Button asChild variant="outline" title="Download every installed jar as a zip to import elsewhere">
+              <a href={`/api/instances/${instanceId}/mods/download`}><Download className="size-4" />Download all (.zip)</a>
+            </Button>
+          ) : (
+            <Button variant="outline" disabled><Download className="size-4" />Download all (.zip)</Button>
+          )}
           <Button variant="outline" disabled={Boolean(pending)} onClick={() => queue("sync_mods")}>
             {pending === "sync_mods" ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}Refresh mods
           </Button>

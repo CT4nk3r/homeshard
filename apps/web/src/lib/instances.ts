@@ -41,7 +41,14 @@ export async function getInstanceDetail(id: string) {
     memoryMb: instance.memoryMb,
     reason: typeof status.reason === "string" ? status.reason : undefined,
     magicDnsName: host?.magicDnsName ?? "",
-    packs,
+    packs: packs.map((pack) => ({
+      id: pack.id,
+      originalName: pack.originalName,
+      sha256: pack.sha256,
+      sizeBytes: pack.sizeBytes,
+      active: pack.active,
+      downloadable: Boolean(pack.blobUrl || pack.coldPath),
+    })),
     mods: mods.map((mod) => ({
       filename: mod.filename,
       enabled: mod.enabled,
