@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { ArrowLeft, Download, FileArchive, MemoryStick, Pickaxe, Server, Users } from "lucide-react";
+import { ArrowLeft, Download, FileArchive, MemoryStick, Pickaxe, Server } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { requireMember } from "@/lib/auth";
@@ -68,10 +68,6 @@ export default async function InstancePage({ params }: { params: Promise<{ id: s
               <div className="flex items-center gap-2">
                 <Pickaxe className="size-3.5 flex-none" />
                 {instance.serverType} {instance.gameVersion}
-              </div>
-              <div className="flex items-center gap-2">
-                <Users className="size-3.5 flex-none" />
-                {instance.players}/{instance.maxPlayers} players
               </div>
               <div className="flex items-center gap-2">
                 <MemoryStick className="size-3.5 flex-none" />
