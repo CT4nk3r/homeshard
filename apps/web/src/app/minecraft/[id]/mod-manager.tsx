@@ -3,9 +3,7 @@
 import { type DragEvent, type FormEvent, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Download, Link, Loader2, Plus, RefreshCw, Save, Upload } from "lucide-react";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import type { ExtraModSource } from "@/lib/instance-mods";
@@ -142,49 +140,53 @@ export function ModManager({ instanceId, mods, state }: { instanceId: string; mo
   }
 
   return (
-    <Card>
-      <CardHeader>
-        <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-start">
-          <div>
-            <CardTitle>Server mods</CardTitle>
-            <CardDescription>Unchecked jars are moved to <span className="font-mono">mods_disabled/</span>; checked jars run from <span className="font-mono">mods/</span>.</CardDescription>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            <Badge variant="outline">{activeCount} enabled</Badge>
-            <Badge variant={disabled.size ? "secondary" : "outline"}>{disabled.size} disabled</Badge>
-          </div>
+    <div className="overflow-hidden rounded-md border border-[var(--border-muted)] bg-[var(--card)]">
+      {/* header */}
+      <div className="flex flex-col justify-between gap-3 border-b border-[var(--border-muted)] px-4 py-3 sm:flex-row sm:items-center">
+        <div>
+          <p className="text-[13px] font-semibold">Server mods</p>
+          <p className="mt-0.5 text-xs text-[var(--muted-foreground)]">
+            Unchecked jars move to <span className="font-mono">mods_disabled/</span>; checked jars run from <span className="font-mono">mods/</span>.
+          </p>
         </div>
-      </CardHeader>
-      <CardContent className="space-y-4">
+        <div className="flex gap-2 text-xs">
+          <span className="rounded-full border border-[var(--border)] px-2 py-0.5 text-[var(--muted-foreground)]">{activeCount} enabled</span>
+          <span className={`rounded-full border px-2 py-0.5 ${disabled.size ? "border-[rgba(210,153,34,0.4)] text-[var(--attention)]" : "border-[var(--border)] text-[var(--muted-foreground)]"}`}>
+            {disabled.size} disabled
+          </span>
+        </div>
+      </div>
+
+      <div className="space-y-4 px-4 py-4">
         {!mods.length ? (
-          <p className="text-sm text-muted-foreground">No mod inventory has been synced yet. Refresh to scan the instance folders.</p>
+          <p className="text-sm text-[var(--muted-foreground)]">No mod inventory has been synced yet. Refresh to scan the instance folders.</p>
         ) : (
-          <div className="max-h-[34rem] overflow-auto rounded-md border">
+          <div className="max-h-[34rem] overflow-auto rounded-md border border-[var(--border-muted)]">
             <Table>
               <TableHeader>
-                <TableRow>
-                  <TableHead className="w-24">Run</TableHead>
-                  <TableHead>Jar</TableHead>
-                  <TableHead className="w-28 text-right">Size</TableHead>
+                <TableRow className="border-[var(--border-muted)] bg-[var(--canvas-inset)]">
+                  <TableHead className="w-24 text-xs text-[var(--muted-foreground)]">Run</TableHead>
+                  <TableHead className="text-xs text-[var(--muted-foreground)]">Jar</TableHead>
+                  <TableHead className="w-28 text-right text-xs text-[var(--muted-foreground)]">Size</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {mods.map((mod) => {
                   const enabled = !disabled.has(mod.filename);
                   return (
-                    <TableRow key={mod.filename}>
+                    <TableRow key={mod.filename} className="border-[var(--border-muted)]">
                       <TableCell>
                         <input
                           type="checkbox"
                           checked={enabled}
                           disabled={Boolean(pending)}
                           onChange={(event) => toggle(mod.filename, event.currentTarget.checked)}
-                          className="size-4 rounded border-input"
+                          className="size-4 rounded border-[var(--border)] accent-[var(--link)]"
                           aria-label={`Run ${mod.filename}`}
                         />
                       </TableCell>
                       <TableCell className="whitespace-normal break-all font-mono text-xs">{mod.filename}</TableCell>
-                      <TableCell className="text-right text-xs text-muted-foreground">{formatBytes(mod.sizeBytes)}</TableCell>
+                      <TableCell className="text-right text-xs text-[var(--muted-foreground)]">{formatBytes(mod.sizeBytes)}</TableCell>
                     </TableRow>
                   );
                 })}
@@ -193,26 +195,26 @@ export function ModManager({ instanceId, mods, state }: { instanceId: string; mo
           </div>
         )}
         <div className="flex flex-wrap gap-2">
-          <Button variant="outline" disabled={Boolean(pending) || state === "trashed"} onClick={() => setAddOpen(true)}>
+          <Button variant="outline" size="sm" disabled={Boolean(pending) || state === "trashed"} onClick={() => setAddOpen(true)}>
             <Plus className="size-4" />Add new mod
           </Button>
           {mods.length ? (
-            <Button asChild variant="outline" title="Download every installed jar as a zip to import elsewhere">
+            <Button asChild variant="outline" size="sm" title="Download every installed jar as a zip to import elsewhere">
               <a href={`/api/instances/${instanceId}/mods/download`}><Download className="size-4" />Download all (.zip)</a>
             </Button>
           ) : (
-            <Button variant="outline" disabled><Download className="size-4" />Download all (.zip)</Button>
+            <Button variant="outline" size="sm" disabled><Download className="size-4" />Download all (.zip)</Button>
           )}
-          <Button variant="outline" disabled={Boolean(pending)} onClick={() => queue("sync_mods")}>
+          <Button variant="outline" size="sm" disabled={Boolean(pending)} onClick={() => queue("sync_mods")}>
             {pending === "sync_mods" ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}Refresh mods
           </Button>
-          <Button disabled={Boolean(pending) || !mods.length || !changed || state === "trashed"} onClick={() => queue("set_instance_mods")}>
+          <Button size="sm" disabled={Boolean(pending) || !mods.length || !changed || state === "trashed"} onClick={() => queue("set_instance_mods")}>
             {pending === "set_instance_mods" ? <Loader2 className="size-4 animate-spin" /> : <Save className="size-4" />}Save and restart
           </Button>
         </div>
-        {message && <p className="text-sm text-muted-foreground">{message}</p>}
-        {error && <p className="text-sm text-destructive">{error}</p>}
-      </CardContent>
+        {message && <p className="text-sm text-[var(--muted-foreground)]">{message}</p>}
+        {error   && <p className="text-sm text-[var(--danger)]">{error}</p>}
+      </div>
       <Dialog open={addOpen} onOpenChange={setAddOpen}>
         <DialogContent>
           <DialogHeader>
@@ -267,7 +269,7 @@ export function ModManager({ instanceId, mods, state }: { instanceId: string; mo
           </form>
         </DialogContent>
       </Dialog>
-    </Card>
+    </div>
   );
 }
 
