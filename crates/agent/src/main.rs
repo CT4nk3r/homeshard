@@ -447,26 +447,91 @@ async fn refresh_instance_statuses(pool: &PgPool) -> Result<()> {
             continue;
         };
 
-        sqlx::query(
+        let row = sqlx::query(
             r#"
             UPDATE instances
-            SET status = COALESCE(status, '{}'::jsonb) || jsonb_build_object(
-                'players', $2::int,
-                'maxPlayers', $3::int,
-                'statusUpdatedAt', now()
-            )
+            SET status = CASE
+                WHEN $2::int = 0 THEN
+                    COALESCE(status, '{}'::jsonb) || jsonb_build_object(
+                        'players', $2::int,
+                        'maxPlayers', $3::int,
+                        'statusUpdatedAt', now(),
+                        'idleSince', COALESCE(status->'idleSince', to_jsonb(now()))
+                    )
+                ELSE
+                    (COALESCE(status, '{}'::jsonb) - 'idleSince') || jsonb_build_object(
+                        'players', $2::int,
+                        'maxPlayers', $3::int,
+                        'statusUpdatedAt', now()
+                    )
+                END
             WHERE id = $1 AND state = 'running'
+            RETURNING
+                idle_timeout_seconds,
+                EXTRACT(EPOCH FROM (now() - (status->>'idleSince')::timestamptz))::bigint
+                    AS idle_seconds
             "#,
         )
         .bind(instance_id)
         .bind(players)
         .bind(max_players)
-        .execute(pool)
+        .fetch_optional(pool)
         .await?;
 
         info!(%instance_id, players, max_players, "instance player count updated");
+
+        let Some(row) = row else {
+            continue;
+        };
+        let idle_timeout_seconds: i32 = row.get("idle_timeout_seconds");
+        let idle_seconds: Option<i64> = row.get("idle_seconds");
+        if idle_action(players, idle_seconds, idle_timeout_seconds) == IdleAction::Sleep {
+            if let Err(error) = sleep_idle_instance(pool, instance_id).await {
+                warn!(%instance_id, error = %error, "could not put idle instance to sleep");
+            }
+        }
     }
 
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum IdleAction {
+    KeepRunning,
+    Sleep,
+}
+
+fn idle_action(players: i32, idle_seconds: Option<i64>, idle_timeout_seconds: i32) -> IdleAction {
+    if players == 0
+        && idle_timeout_seconds > 0
+        && idle_seconds.is_some_and(|elapsed| elapsed >= i64::from(idle_timeout_seconds))
+    {
+        IdleAction::Sleep
+    } else {
+        IdleAction::KeepRunning
+    }
+}
+
+async fn sleep_idle_instance(pool: &PgPool, instance_id: Uuid) -> Result<()> {
+    let container = format!("homeshard-{instance_id}");
+    require_managed_container(&container, instance_id).await?;
+    docker(["stop", &container]).await?;
+    sqlx::query(
+        r#"
+        UPDATE instances
+        SET state = 'sleeping',
+            status = (COALESCE(status, '{}'::jsonb) - 'idleSince') || jsonb_build_object(
+                'players', 0,
+                'statusUpdatedAt', NULL
+            ),
+            updated_at = now()
+        WHERE id = $1 AND state = 'running'
+        "#,
+    )
+    .bind(instance_id)
+    .execute(pool)
+    .await?;
+    info!(%instance_id, "instance put to sleep after idle timeout");
     Ok(())
 }
 
@@ -2156,7 +2221,8 @@ async fn sha256_file(path: &PathBuf) -> Result<String> {
 mod tests {
     use super::{
         blocked_mods_from_cf_logs, cf_name_from_url, curseforge_project_id, curseforge_server_ready,
-        modrinth_slug, parse_meminfo, parse_player_count, pick_minecraft_image, slugify,
+        idle_action, modrinth_slug, parse_meminfo, parse_player_count, pick_minecraft_image, slugify,
+        IdleAction,
     };
 
     #[test]
@@ -2232,6 +2298,27 @@ mod tests {
             parse_player_count("There are many of a max of 20 players online:"),
             None
         );
+    }
+
+    #[test]
+    fn idle_timeout_sleeps_when_elapsed() {
+        assert_eq!(idle_action(0, Some(600), 600), IdleAction::Sleep);
+        assert_eq!(idle_action(0, Some(599), 600), IdleAction::KeepRunning);
+    }
+
+    #[test]
+    fn active_players_reset_idle_decision() {
+        assert_eq!(idle_action(1, Some(900), 600), IdleAction::KeepRunning);
+    }
+
+    #[test]
+    fn missing_idle_observation_does_not_sleep() {
+        assert_eq!(idle_action(0, None, 600), IdleAction::KeepRunning);
+    }
+
+    #[test]
+    fn non_positive_idle_timeout_disables_auto_sleep() {
+        assert_eq!(idle_action(0, Some(600), 0), IdleAction::KeepRunning);
     }
 
     #[test]
