@@ -1,4 +1,8 @@
+"use client";
+
 import Link from "next/link";
+import { useEffect } from "react";
+import { useRouter } from "next/navigation";
 import {
   Activity,
   Bell,
@@ -32,10 +36,24 @@ const STATE_BADGE: Record<string, string> = {
 };
 
 export function DashboardShell({ snapshot }: { snapshot: DashboardSnapshot }) {
+  const router = useRouter();
   const running  = snapshot.instances.filter((i) => i.state === "running").length;
   const nvmeUsed = Math.max(0, 100 - (snapshot.host.nvmeFreeGb / 928) * 100);
   const coldUsed = (snapshot.host.coldUsedGb / snapshot.host.coldLimitGb) * 100;
   const agentOnline = snapshot.host.status === "online";
+
+  useEffect(() => {
+    const refresh = () => router.refresh();
+    const interval = window.setInterval(refresh, 15_000);
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") refresh();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [router]);
 
   return (
     <div className="flex min-h-screen flex-col bg-background">

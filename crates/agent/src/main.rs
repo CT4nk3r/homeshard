@@ -8,12 +8,15 @@ use std::{
     env,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, Instant},
 };
-use tokio::{process::Command, time::sleep};
+use tokio::{
+    process::Command,
+    time::{sleep, timeout},
+};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -37,6 +40,7 @@ struct Settings {
     max_concurrent_commands: usize,
     poll_active_ms: u64,
     poll_idle_ms: u64,
+    instance_status_interval: Duration,
 }
 
 #[derive(Debug)]
@@ -187,8 +191,12 @@ async fn main() -> Result<()> {
 
     let settings = Arc::new(settings);
     let in_flight = Arc::new(AtomicUsize::new(0));
+    let status_refresh_in_flight = Arc::new(AtomicBool::new(false));
     let mut idle_cycles = 0u32;
     let mut last_heartbeat = Instant::now();
+    let mut last_instance_status = Instant::now()
+        .checked_sub(settings.instance_status_interval)
+        .unwrap_or_else(Instant::now);
 
     loop {
         if last_heartbeat.elapsed() >= Duration::from_secs(30) {
@@ -196,6 +204,23 @@ async fn main() -> Result<()> {
                 warn!(error = %error, "heartbeat failed");
             }
             last_heartbeat = Instant::now();
+        }
+
+        if last_instance_status.elapsed() >= settings.instance_status_interval {
+            if status_refresh_in_flight
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                let pool = pool.clone();
+                let status_refresh_in_flight = status_refresh_in_flight.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = refresh_instance_statuses(&pool).await {
+                        warn!(error = %error, "instance status refresh failed");
+                    }
+                    status_refresh_in_flight.store(false, Ordering::SeqCst);
+                });
+            }
+            last_instance_status = Instant::now();
         }
 
         // Cap how many commands run at once. The claim query already prevents
@@ -303,6 +328,13 @@ impl Settings {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10_000),
+            instance_status_interval: Duration::from_secs(
+                env::var("HOMESHARD_INSTANCE_STATUS_INTERVAL_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|seconds| *seconds > 0)
+                    .unwrap_or(15),
+            ),
         })
     }
 
@@ -382,6 +414,67 @@ async fn collect_host_metrics(settings: &Settings) -> Value {
         "nvmeFreeGb": nvme_free_gb,
         "coldUsedGb": cold_used_gb
     })
+}
+
+async fn refresh_instance_statuses(pool: &PgPool) -> Result<()> {
+    let rows = sqlx::query("SELECT id FROM instances WHERE state = 'running'")
+        .fetch_all(pool)
+        .await?;
+
+    for row in rows {
+        let instance_id: Uuid = row.get("id");
+        let container = format!("homeshard-{instance_id}");
+        let result = timeout(
+            Duration::from_secs(5),
+            docker_exec(&[&container, "rcon-cli", "list"]),
+        )
+        .await;
+
+        let output = match result {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => {
+                warn!(%instance_id, error = %error, "could not query instance player count");
+                continue;
+            }
+            Err(_) => {
+                warn!(%instance_id, "instance player count query timed out");
+                continue;
+            }
+        };
+
+        let Some((players, max_players)) = parse_player_count(&output) else {
+            warn!(%instance_id, output = %output, "could not parse instance player count");
+            continue;
+        };
+
+        sqlx::query(
+            r#"
+            UPDATE instances
+            SET status = COALESCE(status, '{}'::jsonb) || jsonb_build_object(
+                'players', $2::int,
+                'maxPlayers', $3::int,
+                'statusUpdatedAt', now()
+            )
+            WHERE id = $1 AND state = 'running'
+            "#,
+        )
+        .bind(instance_id)
+        .bind(players)
+        .bind(max_players)
+        .execute(pool)
+        .await?;
+
+        info!(%instance_id, players, max_players, "instance player count updated");
+    }
+
+    Ok(())
+}
+
+fn parse_player_count(output: &str) -> Option<(i32, i32)> {
+    let (_, after_prefix) = output.split_once("There are ")?;
+    let (players, after_players) = after_prefix.split_once(" of a max of ")?;
+    let (max_players, _) = after_players.split_once(" players online")?;
+    Some((players.trim().parse().ok()?, max_players.trim().parse().ok()?))
 }
 
 fn parse_meminfo(contents: &str) -> Option<(f64, f64)> {
@@ -1912,12 +2005,34 @@ async fn docker_lifecycle(
         "stop" => "sleeping",
         _ => "stopped",
     };
-    update_instance_state(pool, instance_id, state, json!({})).await?;
+    let status_patch = if state == "running" {
+        json!({})
+    } else {
+        json!({ "players": 0, "statusUpdatedAt": Value::Null })
+    };
+    merge_instance_state(pool, instance_id, state, status_patch).await?;
     Ok(CommandResult {
         ok: true,
         message: format!("{action} queued for {instance_id}"),
         data: json!({ "instanceId": instance_id, "state": state }),
     })
+}
+
+async fn merge_instance_state(
+    pool: &PgPool,
+    instance_id: Uuid,
+    state: &str,
+    status_patch: Value,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE instances SET state = $2::instance_state, status = COALESCE(status, '{}'::jsonb) || $3::jsonb, updated_at = now() WHERE id = $1",
+    )
+    .bind(instance_id)
+    .bind(state)
+    .bind(status_patch)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 async fn require_managed_container(container: &str, instance_id: Uuid) -> Result<()> {
@@ -1961,8 +2076,9 @@ async fn docker_owned(args: &[String]) -> Result<String> {
 }
 
 async fn run_command(program: &str, args: &[&str]) -> Result<String> {
-    let output = Command::new(program)
-        .args(args)
+    let mut command = Command::new(program);
+    command.kill_on_drop(true).args(args);
+    let output = command
         .output()
         .await
         .with_context(|| format!("launch {program} command"))?;
@@ -2040,7 +2156,7 @@ async fn sha256_file(path: &PathBuf) -> Result<String> {
 mod tests {
     use super::{
         blocked_mods_from_cf_logs, cf_name_from_url, curseforge_project_id, curseforge_server_ready,
-        modrinth_slug, parse_meminfo, pick_minecraft_image, slugify,
+        modrinth_slug, parse_meminfo, parse_player_count, pick_minecraft_image, slugify,
     };
 
     #[test]
@@ -2091,6 +2207,31 @@ mod tests {
     fn parses_memory_metrics() {
         let metrics = parse_meminfo("MemTotal:       32505856 kB\nMemAvailable:   24117248 kB\n");
         assert_eq!(metrics, Some((31.0, 8.0)));
+    }
+
+    #[test]
+    fn parses_player_counts() {
+        assert_eq!(
+            parse_player_count("There are 0 of a max of 20 players online:"),
+            Some((0, 20))
+        );
+        assert_eq!(
+            parse_player_count("There are 1 of a max of 20 players online: PlayerOne"),
+            Some((1, 20))
+        );
+        assert_eq!(
+            parse_player_count("There are 3 of a max of 12 players online: One, Two, Three"),
+            Some((3, 12))
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_player_counts() {
+        assert_eq!(parse_player_count("No players are online"), None);
+        assert_eq!(
+            parse_player_count("There are many of a max of 20 players online:"),
+            None
+        );
     }
 
     #[test]

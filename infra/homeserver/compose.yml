@@ -100,6 +100,7 @@ services:
       # Hostname/IP players use to connect (e.g. a Tailscale MagicDNS name).
       # Shown in the dashboard; leave blank to display a placeholder.
       HOMESHARD_MAGIC_DNS: ${HOMESHARD_MAGIC_DNS:-}
+      HOMESHARD_INSTANCE_STATUS_INTERVAL_SECS: ${HOMESHARD_INSTANCE_STATUS_INTERVAL_SECS:-15}
       # IP that game container ports bind to on the host. Use your Tailscale IP
       # to keep servers private, or 0.0.0.0 to expose on all interfaces.
       HOMESHARD_GAME_BIND_IP: ${HOMESHARD_GAME_BIND_IP:-0.0.0.0}
