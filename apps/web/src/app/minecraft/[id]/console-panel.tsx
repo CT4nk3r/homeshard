@@ -1,11 +1,7 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Send, TerminalSquare } from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
-import { ScrollArea } from "@/components/ui/scroll-area";
 
 type CommandStatus = {
   id: string;
@@ -21,15 +17,22 @@ const wait = (ms: number) => new Promise((resolve) => window.setTimeout(resolve,
 
 export function ConsolePanel({ instanceId }: { instanceId: string }) {
   const [command, setCommand] = useState("");
-  const [lines, setLines] = useState(["Homeshard console queues compact commands. Full logs stay on the homeserver."]);
+  const [lines, setLines] = useState<{ text: string; kind: "sys" | "in" | "out" | "err" }[]>([
+    { text: "Homeshard console queues compact commands. Full logs stay on the homeserver.", kind: "sys" },
+  ]);
   const [busy, setBusy] = useState(false);
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+  }, [lines]);
 
   async function send() {
     if (!command.trim() || busy) return;
     const value = command.trim();
     setCommand("");
     setBusy(true);
-    setLines((current) => [...current, `> ${value}`]);
+    setLines((cur) => [...cur, { text: `> ${value}`, kind: "in" }]);
     try {
       const response = await fetch("/api/commands", {
         method: "POST",
@@ -38,10 +41,10 @@ export function ConsolePanel({ instanceId }: { instanceId: string }) {
       });
       const body = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(body.error ?? "Command could not be queued.");
-      setLines((current) => [...current, "Command queued."]);
+      setLines((cur) => [...cur, { text: "Command queued.", kind: "sys" }]);
       if (body.id) await waitForCommand(body.id);
     } catch (error) {
-      setLines((current) => [...current, error instanceof Error ? error.message : "Command failed."]);
+      setLines((cur) => [...cur, { text: error instanceof Error ? error.message : "Command failed.", kind: "err" }]);
     } finally {
       setBusy(false);
     }
@@ -53,10 +56,13 @@ export function ConsolePanel({ instanceId }: { instanceId: string }) {
       const status = (await response.json()) as CommandStatus;
       if (!response.ok) throw new Error(status.error ?? "Could not read command status.");
       if (status.status === "claimed") {
-        setLines((current) => [...current, "Agent is sending it to RCON..."]);
+        setLines((cur) => [...cur, { text: "Agent is sending it to RCON...", kind: "sys" }]);
       } else if (status.status === "succeeded") {
         const output = status.result?.data?.output?.trim();
-        setLines((current) => [...current, output ? `< ${output}` : status.result?.message ?? "Command executed."]);
+        setLines((cur) => [
+          ...cur,
+          { text: output ? `< ${output}` : (status.result?.message ?? "Command executed."), kind: "out" },
+        ]);
         return;
       } else if (status.status === "failed") {
         throw new Error(status.error ?? status.result?.message ?? "Command failed.");
@@ -66,5 +72,54 @@ export function ConsolePanel({ instanceId }: { instanceId: string }) {
     throw new Error("Still waiting for the homeserver agent.");
   }
 
-  return <Card><CardHeader><CardTitle className="flex items-center gap-2"><TerminalSquare className="size-5" />Console</CardTitle><CardDescription>Near-realtime through the Neon command queue; no full console history is written to Neon.</CardDescription></CardHeader><CardContent className="space-y-4"><ScrollArea className="h-80 rounded-md border bg-black/40 p-4 font-mono text-xs text-zinc-300"><div className="space-y-1">{lines.map((line, index) => <p key={`${index}-${line}`}>{line}</p>)}</div></ScrollArea><div className="flex gap-2"><Input value={command} onChange={(event) => setCommand(event.target.value)} onKeyDown={(event) => event.key === "Enter" && send()} placeholder="say hello from Homeshard" className="font-mono" disabled={busy} /><Button onClick={send} disabled={busy}><Send className="size-4" />Send</Button></div></CardContent></Card>;
+  return (
+    <div className="overflow-hidden rounded-md border border-[var(--border-muted)] bg-[var(--card)]">
+      <div className="flex items-center gap-2 border-b border-[var(--border-muted)] px-4 py-3">
+        <TerminalSquare className="size-4 text-[var(--muted-foreground)]" />
+        <span className="text-[13px] font-semibold">Console</span>
+        <span className="ml-auto text-xs text-[var(--text-faint)]">Near-realtime via Neon command queue</span>
+      </div>
+
+      <div
+        ref={scrollRef}
+        className="h-80 overflow-y-auto bg-[var(--canvas-inset)] px-4 py-3 font-mono text-[12.5px] leading-relaxed"
+        role="log"
+        aria-label="Server console output"
+        tabIndex={0}
+      >
+        {lines.map((line, i) => (
+          <div
+            key={i}
+            className={
+              line.kind === "in"  ? "text-[var(--link)]"    :
+              line.kind === "out" ? "text-[var(--success)]" :
+              line.kind === "err" ? "text-[var(--danger)]"  :
+                                    "text-[var(--text-faint)]"
+            }
+          >
+            {line.text}
+          </div>
+        ))}
+      </div>
+
+      <div className="flex gap-2 border-t border-[var(--border-muted)] bg-[var(--canvas-inset)] px-4 py-3">
+        <input
+          value={command}
+          onChange={(e) => setCommand(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && send()}
+          placeholder="say hello from Homeshard"
+          disabled={busy}
+          className="min-w-0 flex-1 rounded-md border border-[var(--border)] bg-[var(--canvas)] px-3 py-1.5 font-mono text-xs text-foreground placeholder:text-[var(--text-faint)] focus:border-[var(--link)] focus:outline-none disabled:opacity-50"
+        />
+        <button
+          onClick={send}
+          disabled={busy || !command.trim()}
+          className="inline-flex items-center gap-1.5 rounded-md border border-[var(--border-interactive)] bg-[var(--card)] px-3 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-[var(--panel-hover)] disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          <Send className="size-3.5" />
+          Send
+        </button>
+      </div>
+    </div>
+  );
 }

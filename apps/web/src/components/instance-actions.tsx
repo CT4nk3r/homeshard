@@ -3,7 +3,6 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { Loader2, Moon, Play, RefreshCw, RotateCcw, Square, Trash2 } from "lucide-react";
-import { Button } from "@/components/ui/button";
 import type { InstanceState } from "@/lib/types";
 
 type CommandStatus = {
@@ -14,7 +13,23 @@ type CommandStatus = {
 
 const wait = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
 
-export function InstanceActions({ instanceId, state, disabled = false }: { instanceId: string; state: InstanceState; disabled?: boolean }) {
+const BASE =
+  "inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)] disabled:cursor-not-allowed disabled:opacity-50";
+
+const BTN = {
+  default: `${BASE} border-[var(--border-interactive)] bg-[var(--card)] text-foreground hover:bg-[var(--panel-hover)]`,
+  danger:  `${BASE} border-[rgba(248,81,73,0.4)] bg-[var(--danger-muted)] text-[var(--danger)] hover:border-[var(--danger)]`,
+};
+
+export function InstanceActions({
+  instanceId,
+  state,
+  disabled = false,
+}: {
+  instanceId: string;
+  state: InstanceState;
+  disabled?: boolean;
+}) {
   const router = useRouter();
   const [pending, setPending] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -22,9 +37,12 @@ export function InstanceActions({ instanceId, state, disabled = false }: { insta
   const unavailable = disabled || state === "failed" || state === "deploying" || state === "trashed";
 
   async function command(kind: string) {
-    if (kind === "trash" && !window.confirm("Delete this instance? This stops and removes its managed container, hides it from the dashboard, and moves its files to trash.")) {
-      return;
-    }
+    if (
+      kind === "trash" &&
+      !window.confirm(
+        "Delete this instance? This stops and removes its managed container, hides it from the dashboard, and moves its files to trash.",
+      )
+    ) return;
     setPending(kind);
     setError(null);
     setNotice(null);
@@ -52,16 +70,16 @@ export function InstanceActions({ instanceId, state, disabled = false }: { insta
 
   async function waitForCommand(id: string, kind: string) {
     for (let attempt = 0; attempt < 40; attempt += 1) {
-      const command = await readCommand(id);
-      if (command.status === "queued") {
+      const cmd = await readCommand(id);
+      if (cmd.status === "queued") {
         setNotice(`${kindLabel(kind)} queued. Waiting for the homeserver agent...`);
-      } else if (command.status === "claimed") {
+      } else if (cmd.status === "claimed") {
         setNotice(`${kindLabel(kind)} is running on the homeserver...`);
-      } else if (command.status === "succeeded") {
-        setNotice(command.result?.message ?? `${kindLabel(kind)} completed.`);
+      } else if (cmd.status === "succeeded") {
+        setNotice(cmd.result?.message ?? `${kindLabel(kind)} completed.`);
         return;
-      } else if (command.status === "failed") {
-        throw new Error(command.error ?? command.result?.message ?? `${kindLabel(kind)} failed`);
+      } else if (cmd.status === "failed") {
+        throw new Error(cmd.error ?? cmd.result?.message ?? `${kindLabel(kind)} failed`);
       }
       await wait(1500);
     }
@@ -71,34 +89,47 @@ export function InstanceActions({ instanceId, state, disabled = false }: { insta
   async function runCommand(kind: string) {
     try {
       await command(kind);
-    } catch (error) {
-      setError(error instanceof Error ? error.message : "Could not queue command");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not queue command");
     }
   }
 
-  const action = (kind: string, label: string, icon: React.ReactNode, disabled = false, variant: "outline" | "destructive" = "outline") => (
-    <Button key={kind} size="sm" variant={variant} disabled={Boolean(pending) || disabled} onClick={() => runCommand(kind)}>
-      {pending === kind ? <Loader2 className="size-3.5 animate-spin" /> : icon}{label}
-    </Button>
-  );
+  function btn(
+    kind: string,
+    label: string,
+    icon: React.ReactNode,
+    isDisabled = false,
+    variant: keyof typeof BTN = "default",
+  ) {
+    return (
+      <button
+        key={kind}
+        className={BTN[variant]}
+        disabled={Boolean(pending) || isDisabled}
+        onClick={() => runCommand(kind)}
+      >
+        {pending === kind ? <Loader2 className="size-3.5 animate-spin" /> : icon}
+        {label}
+      </button>
+    );
+  }
 
-  return <div className="space-y-2">
-    <div className="flex flex-wrap gap-2">
-      {state === "failed" && action("retry_deploy", "Retry deployment", <RotateCcw className="size-3.5" />, disabled)}
-      {action("start", "Start", <Play className="size-3.5" />, unavailable || state === "running")}
-      {action("restart", "Restart", <RefreshCw className="size-3.5" />, unavailable || state !== "running")}
-      {action("stop", "Stop", <Square className="size-3.5" />, unavailable || state === "stopped" || state === "sleeping")}
-      {action("sleep", "Sleep", <Moon className="size-3.5" />, unavailable || state !== "running")}
-      {action("trash", "Delete", <Trash2 className="size-3.5" />, disabled || state === "trashed", "destructive")}
+  return (
+    <div className="space-y-2">
+      <div className="flex flex-wrap gap-1.5">
+        {state === "failed" && btn("retry_deploy", "Retry deploy", <RotateCcw className="size-3.5" />, disabled)}
+        {btn("start",   "Start",   <Play      className="size-3.5" />, unavailable || state === "running")}
+        {btn("restart", "Restart", <RefreshCw className="size-3.5" />, unavailable || state !== "running")}
+        {btn("stop",    "Stop",    <Square    className="size-3.5" />, unavailable || state === "stopped" || state === "sleeping")}
+        {btn("sleep",   "Sleep",   <Moon      className="size-3.5" />, unavailable || state !== "running")}
+        {btn("trash",   "Delete",  <Trash2    className="size-3.5" />, disabled || state === "trashed", "danger")}
+      </div>
+      {notice && <p className="text-xs text-[var(--muted-foreground)]">{notice}</p>}
+      {error  && <p className="text-xs text-[var(--danger)]">{error}</p>}
     </div>
-    {notice && <p className="text-xs text-muted-foreground">{notice}</p>}
-    {error && <p className="text-xs text-destructive">{error}</p>}
-  </div>;
+  );
 }
 
 function kindLabel(kind: string) {
-  return kind
-    .split("_")
-    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
-    .join(" ");
+  return kind.split("_").map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
 }
