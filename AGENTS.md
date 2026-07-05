@@ -15,6 +15,8 @@ Read the nearest nested `AGENTS.md` before changing one of these areas.
 
 ## Working rules
 
+- Multiple agents may share this checkout concurrently. Assume unfamiliar working-tree changes
+  belong to another active task; never overwrite, revert, stage, or commit them without confirmation.
 - Preserve user changes; check `git status` before editing and keep unrelated diffs untouched.
 - Treat command kinds/payloads and database columns as cross-component APIs. Update producers,
   consumers, types, and migrations together.
