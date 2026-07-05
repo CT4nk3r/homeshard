@@ -93,6 +93,12 @@ pnpm --filter web dev                          # run the dashboard locally
 cargo check --manifest-path crates/agent/Cargo.toml
 ```
 
+## Preview and live deployments
+
+Two isolated environments can run on the same Docker host, with an immutable
+image promoted from preview to live. See
+[`infra/homeserver/ENVIRONMENTS.md`](infra/homeserver/ENVIRONMENTS.md).
+
 ## License
 
 Homeshard is licensed under the **GNU Affero General Public License v3.0**. See

@@ -37,9 +37,8 @@ docker compose up -d --build
 docker compose --profile agent up -d --build
 ```
 
-The `migrate` service applies every `apps/web/drizzle/*.sql` file on a fresh
-database and is a no-op afterwards. The dashboard listens on `WEB_PORT` (8010 by
-default).
+The `migrate` service records and applies each `apps/web/drizzle/*.sql` file once,
+in filename order. The dashboard listens on `WEB_PORT` (8010 by default).
 
 ## Networking & privacy
 
