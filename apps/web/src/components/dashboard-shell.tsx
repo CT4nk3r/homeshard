@@ -70,12 +70,12 @@ export function DashboardShell({ snapshot }: { snapshot: DashboardSnapshot }) {
 
         <div className="flex items-center gap-1.5 rounded-full border border-[var(--border)] bg-[var(--card)] px-2.5 py-1 text-xs text-[var(--muted-foreground)]">
           <span className={`size-1.5 flex-none rounded-full ${agentOnline ? "bg-[var(--success)] pulse-dot" : "bg-[var(--text-faint)]"}`} />
-          Agent {snapshot.host.status}
+          Agent {snapshot.host.status} · {snapshot.host.lastSeenLabel}
         </div>
 
         <div className="hidden items-center gap-1.5 rounded-full border border-[var(--border)] bg-[var(--card)] px-2.5 py-1 text-xs text-[var(--muted-foreground)] sm:flex">
           <span className="size-1.5 flex-none rounded-full bg-[var(--link)]" />
-          {snapshot.host.name || "homeshard-host"}
+          {snapshot.host.agentId}
         </div>
 
         <div className="flex-1" />
@@ -144,7 +144,7 @@ export function DashboardShell({ snapshot }: { snapshot: DashboardSnapshot }) {
 
           {/* host stat grid */}
           <div className="mb-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-            <StatCard label="Agent"        value={snapshot.host.status}                              sub={snapshot.demoMode ? "Demo mode" : snapshot.host.name} />
+            <StatCard label="Agent"        value={snapshot.host.status}                              sub={snapshot.demoMode ? "Demo mode" : `${snapshot.host.agentId} · ${snapshot.host.lastSeenLabel}`} />
             <StatCard label="Memory"       value={`${snapshot.host.memoryUsedGb} / ${snapshot.host.memoryTotalGb} GiB`} sub="8 GiB host reserve" />
             <StatCard label="NVMe free"    value={`${snapshot.host.nvmeFreeGb} GiB`}                 sub={<BarFill pct={nvmeUsed} />} />
             <StatCard label="Cold storage" value={`${snapshot.host.coldUsedGb} / ${snapshot.host.coldLimitGb} GiB`}    sub={<BarFill pct={coldUsed} />} />

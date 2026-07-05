@@ -1,4 +1,4 @@
-import { desc, eq } from "drizzle-orm";
+import { desc, eq, sql } from "drizzle-orm";
 import { getDb, hasDatabase } from "@/db/client";
 import { hosts, instanceMods, instances, packRevisions } from "@/db/schema";
 import type { InstanceState } from "./types";
@@ -27,7 +27,11 @@ export async function getInstanceDetail(id: string) {
   const [packs, mods, host] = await Promise.all([
     db.select().from(packRevisions).where(eq(packRevisions.instanceId, id)).orderBy(desc(packRevisions.createdAt)),
     db.select().from(instanceMods).where(eq(instanceMods.instanceId, id)).orderBy(instanceMods.filename),
-    db.query.hosts.findFirst({ orderBy: [desc(hosts.lastSeenAt)] }),
+    instance.hostId
+      ? db.query.hosts.findFirst({ where: eq(hosts.id, instance.hostId) })
+      : db.query.hosts.findFirst({
+          orderBy: [sql`${hosts.lastSeenAt} DESC NULLS LAST`, desc(hosts.createdAt)],
+        }),
   ]);
   const status = instance.status as Record<string, unknown>;
   return {
