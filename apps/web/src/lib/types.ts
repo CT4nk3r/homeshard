@@ -32,8 +32,11 @@ export type DashboardSnapshot = {
   actor: { email: string; role: UserRole; displayName: string };
   host: {
     name: string;
+    agentId: string;
     magicDnsName: string;
     status: "online" | "offline" | "demo";
+    lastSeenAt: string | null;
+    lastSeenLabel: string;
     memoryUsedGb: number;
     memoryTotalGb: number;
     nvmeFreeGb: number;

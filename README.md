@@ -59,6 +59,9 @@ Everything is driven by environment variables — see
 documented list. The essentials:
 
 - `POSTGRES_PASSWORD`, `OWNER_EMAIL` — set these.
+- `HOMESHARD_AGENT_ID` — unique identity for each agent sharing a database.
+- `HOMESHARD_AGENT_OFFLINE_AFTER_SECS` — heartbeat age at which the dashboard
+  marks an agent offline (default: 90 seconds).
 - `HOMESHARD_MAGIC_DNS` — the hostname players connect to (e.g. your Tailscale
   MagicDNS name); shown in the dashboard.
 - `HOMESHARD_GAME_BIND_IP` — the IP game ports bind to. Use your **Tailscale IP**
@@ -92,6 +95,12 @@ pnpm install                                   # web deps (root of repo)
 pnpm --filter web dev                          # run the dashboard locally
 cargo check --manifest-path crates/agent/Cargo.toml
 ```
+
+## Preview and live deployments
+
+Two isolated environments can run on the same Docker host, with an immutable
+image promoted from preview to live. See
+[`infra/homeserver/ENVIRONMENTS.md`](infra/homeserver/ENVIRONMENTS.md).
 
 ## License
 

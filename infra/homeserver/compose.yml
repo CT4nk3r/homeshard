@@ -29,8 +29,7 @@ services:
     volumes:
       - homeshard-db:/var/lib/postgresql/data
 
-  # Applies every apps/web/drizzle/*.sql migration on a fresh database and is a
-  # no-op once the schema exists.
+  # Applies each apps/web/drizzle/*.sql migration once, in filename order.
   migrate:
     image: postgres:17-alpine
     depends_on:
@@ -43,14 +42,19 @@ services:
       - -c
       - >-
         until psql -h postgres -U ${POSTGRES_USER:-homeshard} -d ${POSTGRES_DB:-homeshard} -tAc "select 1" >/dev/null 2>&1; do sleep 1; done;
-        if psql -h postgres -U ${POSTGRES_USER:-homeshard} -d ${POSTGRES_DB:-homeshard} -tAc "select to_regclass('public.users')" | grep -q users;
-        then echo "schema already present, skipping migrations";
-        else for f in $$(ls /migrations/*.sql | sort); do echo "applying $$f"; psql -v ON_ERROR_STOP=1 -h postgres -U ${POSTGRES_USER:-homeshard} -d ${POSTGRES_DB:-homeshard} -f "$$f"; done;
-        fi
+        psql -v ON_ERROR_STOP=1 -h postgres -U ${POSTGRES_USER:-homeshard} -d ${POSTGRES_DB:-homeshard} -c "CREATE TABLE IF NOT EXISTS homeshard_schema_migrations (name text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())";
+        if [ "$$(psql -h postgres -U ${POSTGRES_USER:-homeshard} -d ${POSTGRES_DB:-homeshard} -tAc "SELECT count(*) FROM homeshard_schema_migrations")" = "0" ] && [ "$$(psql -h postgres -U ${POSTGRES_USER:-homeshard} -d ${POSTGRES_DB:-homeshard} -tAc "SELECT to_regclass('public.users') IS NOT NULL")" = "t" ];
+        then psql -v ON_ERROR_STOP=1 -h postgres -U ${POSTGRES_USER:-homeshard} -d ${POSTGRES_DB:-homeshard} -c "INSERT INTO homeshard_schema_migrations(name) VALUES ('0000_calm_nuke.sql') ON CONFLICT DO NOTHING";
+        fi;
+        for f in $$(ls /migrations/*.sql | sort); do name=$$(basename "$$f");
+        if [ "$$(psql -h postgres -U ${POSTGRES_USER:-homeshard} -d ${POSTGRES_DB:-homeshard} -tAc "SELECT count(*) FROM homeshard_schema_migrations WHERE name = '$$name'")" = "0" ];
+        then echo "applying $$name"; { cat "$$f"; echo "INSERT INTO homeshard_schema_migrations(name) VALUES ('$$name');"; } | psql -v ON_ERROR_STOP=1 --single-transaction -h postgres -U ${POSTGRES_USER:-homeshard} -d ${POSTGRES_DB:-homeshard};
+        else echo "already applied $$name"; fi; done
     volumes:
       - ../../apps/web/drizzle:/migrations:ro
 
   web:
+    image: ${HOMESHARD_WEB_IMAGE:-homeshard-web:local}
     build:
       context: ../..
       dockerfile: apps/web/Dockerfile
@@ -72,6 +76,7 @@ services:
       # Optional Vercel Blob token for cloud pack staging.
       BLOB_READ_WRITE_TOKEN: ${BLOB_READ_WRITE_TOKEN:-}
       HOMESHARD_LOCAL_STAGING_DIR: /staging
+      HOMESHARD_AGENT_OFFLINE_AFTER_SECS: ${HOMESHARD_AGENT_OFFLINE_AFTER_SECS:-90}
       HOMESHARD_MISSING_MODS_DIR: /missing-mods
       # Read-only access to the agent's instance + cold-storage dirs (identity
       # mounts) so the dashboard can serve pack files and stream mod jars.
@@ -87,6 +92,7 @@ services:
 
   agent:
     profiles: ["agent"]
+    image: ${HOMESHARD_AGENT_IMAGE:-homeshard-agent:local}
     build:
       context: ../..
       dockerfile: crates/agent/Dockerfile
@@ -107,6 +113,8 @@ services:
       # IP that game container ports bind to on the host. Use your Tailscale IP
       # to keep servers private, or 0.0.0.0 to expose on all interfaces.
       HOMESHARD_GAME_BIND_IP: ${HOMESHARD_GAME_BIND_IP:-0.0.0.0}
+      HOMESHARD_GAME_PORT_START: ${HOMESHARD_GAME_PORT_START:-25600}
+      HOMESHARD_GAME_PORT_END: ${HOMESHARD_GAME_PORT_END:-25699}
       HOMESHARD_MINECRAFT_IMAGE: ${HOMESHARD_MINECRAFT_IMAGE:-itzg/minecraft-server:java21}
       # JRE image for newer Minecraft (e.g. 26.x). Classic 1.x packs use the
       # image above; the agent picks the right one per pack automatically.

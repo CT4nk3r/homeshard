@@ -1,8 +1,9 @@
-import { count, desc, eq, isNull, ne } from "drizzle-orm";
+import { count, desc, eq, isNull, ne, sql } from "drizzle-orm";
 import { getDb, hasDatabase } from "@/db/client";
 import { alerts, hosts, instances, users } from "@/db/schema";
 import type { Actor } from "./auth";
 import type { DashboardSnapshot, InstanceState } from "./types";
+import { agentLastSeenLabel, isAgentOnline } from "./agent-status";
 
 export async function getDashboardSnapshot(actor: Actor): Promise<DashboardSnapshot> {
   if (!hasDatabase()) {
@@ -12,7 +13,10 @@ export async function getDashboardSnapshot(actor: Actor): Promise<DashboardSnaps
       host: {
         status: "demo",
         name: "homeserver",
+        agentId: "demo",
         magicDnsName: "",
+        lastSeenAt: null,
+        lastSeenLabel: "Demo mode",
         memoryUsedGb: 3.6,
         memoryTotalGb: 31,
         nvmeFreeGb: 99,
@@ -40,7 +44,9 @@ export async function getDashboardSnapshot(actor: Actor): Promise<DashboardSnaps
 
   const db = getDb();
   const [host, rows, [pending], [activeAlerts]] = await Promise.all([
-    db.query.hosts.findFirst({ orderBy: [desc(hosts.lastSeenAt)] }),
+    db.query.hosts.findFirst({
+      orderBy: [sql`${hosts.lastSeenAt} DESC NULLS LAST`, desc(hosts.createdAt)],
+    }),
     db.select().from(instances).where(ne(instances.state, "trashed")).orderBy(desc(instances.createdAt)),
     db.select({ value: count() }).from(users).where(eq(users.role, "pending")),
     db.select({ value: count() }).from(alerts).where(isNull(alerts.acknowledgedAt)),
@@ -48,14 +54,18 @@ export async function getDashboardSnapshot(actor: Actor): Promise<DashboardSnaps
   const metrics = (host?.metrics ?? {}) as Record<string, unknown>;
   const numberMetric = (name: string, fallback: number) =>
     typeof metrics[name] === "number" ? metrics[name] : fallback;
+  const now = new Date();
 
   return {
     demoMode: false,
     actor: { email: actor.email, role: actor.role, displayName: actor.displayName },
     host: {
-      status: host?.status === "online" ? "online" : "offline",
+      status: isAgentOnline(host?.lastSeenAt, now) ? "online" : "offline",
       name: host?.name ?? "homeserver",
+      agentId: host?.agentId ?? "unregistered",
       magicDnsName: host?.magicDnsName ?? "",
+      lastSeenAt: host?.lastSeenAt?.toISOString() ?? null,
+      lastSeenLabel: agentLastSeenLabel(host?.lastSeenAt, now),
       memoryUsedGb: numberMetric("memoryUsedGb", 0),
       memoryTotalGb: numberMetric("memoryTotalGb", 31),
       nvmeFreeGb: numberMetric("nvmeFreeGb", 0),
