@@ -31,6 +31,8 @@ struct Settings {
     staging_root: PathBuf,
     magic_dns_name: String,
     game_bind_ip: String,
+    game_port_start: i32,
+    game_port_end: i32,
     minecraft_image: String,
     minecraft_image_modern: String,
     blob_token: Option<String>,
@@ -299,6 +301,14 @@ impl Settings {
             magic_dns_name: env::var("HOMESHARD_MAGIC_DNS").unwrap_or_default(),
             game_bind_ip: env::var("HOMESHARD_GAME_BIND_IP")
                 .unwrap_or_else(|_| "0.0.0.0".into()),
+            game_port_start: env::var("HOMESHARD_GAME_PORT_START")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(25600),
+            game_port_end: env::var("HOMESHARD_GAME_PORT_END")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(25699),
             minecraft_image: env::var("HOMESHARD_MINECRAFT_IMAGE")
                 .unwrap_or_else(|_| "itzg/minecraft-server:java21".into()),
             // Newer Minecraft (e.g. 26.x) needs a newer JRE than 1.x packs; the
@@ -335,6 +345,17 @@ impl Settings {
                     .filter(|seconds| *seconds > 0)
                     .unwrap_or(15),
             ),
+        })
+        .and_then(|settings| {
+            if !(1..=65535).contains(&settings.game_port_start)
+                || !(1..=65535).contains(&settings.game_port_end)
+                || settings.game_port_start > settings.game_port_end
+            {
+                return Err(anyhow!(
+                    "HOMESHARD_GAME_PORT_START..HOMESHARD_GAME_PORT_END must be a valid TCP port range"
+                ));
+            }
+            Ok(settings)
         })
     }
 
@@ -661,7 +682,7 @@ async fn create_instance(
     let payload: CreateInstancePayload =
         serde_json::from_value(command.payload).context("invalid create_instance payload")?;
     let slug = unique_slug(pool, &payload.name).await?;
-    let port = allocate_port(pool).await?;
+    let port = allocate_port(pool, settings.game_port_start, settings.game_port_end).await?;
     let instance_id = Uuid::new_v4();
     let server_type = payload.server_type.unwrap_or_else(|| "VANILLA".into());
     let game_version = payload.game_version.unwrap_or_else(|| "LATEST".into());
@@ -2091,15 +2112,17 @@ async fn run_command(program: &str, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-async fn allocate_port(pool: &PgPool) -> Result<i32> {
+async fn allocate_port(pool: &PgPool, port_start: i32, port_end: i32) -> Result<i32> {
     let row = sqlx::query(
         r#"
-        SELECT port FROM generate_series(25600, 25699) AS port
+        SELECT port FROM generate_series($1::integer, $2::integer) AS port
         WHERE port NOT IN (SELECT port FROM instances WHERE state != 'trashed')
         ORDER BY port ASC
         LIMIT 1
         "#,
     )
+    .bind(port_start)
+    .bind(port_end)
     .fetch_one(pool)
     .await?;
     Ok(row.get("port"))
