@@ -6,7 +6,10 @@ use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use std::{
     collections::{BTreeMap, HashSet},
     env,
+    io::{Cursor, Read, Write},
+    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
+    process,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
@@ -31,6 +34,7 @@ struct Settings {
     staging_root: PathBuf,
     magic_dns_name: String,
     game_bind_ip: String,
+    sleep_proxy_image: String,
     game_port_start: i32,
     game_port_end: i32,
     minecraft_image: String,
@@ -170,6 +174,10 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    if env::args().nth(1).as_deref() == Some("sleep-proxy") {
+        return run_sleep_proxy();
+    }
+
     let settings = Settings::from_env()?;
     tokio::fs::create_dir_all(&settings.active_root).await?;
     tokio::fs::create_dir_all(settings.cold_root.join("packs")).await?;
@@ -214,9 +222,10 @@ async fn main() -> Result<()> {
                 .is_ok()
             {
                 let pool = pool.clone();
+                let settings = settings.clone();
                 let status_refresh_in_flight = status_refresh_in_flight.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = refresh_instance_statuses(&pool).await {
+                    if let Err(error) = refresh_instance_statuses(&pool, &settings).await {
                         warn!(error = %error, "instance status refresh failed");
                     }
                     status_refresh_in_flight.store(false, Ordering::SeqCst);
@@ -301,6 +310,8 @@ impl Settings {
             magic_dns_name: env::var("HOMESHARD_MAGIC_DNS").unwrap_or_default(),
             game_bind_ip: env::var("HOMESHARD_GAME_BIND_IP")
                 .unwrap_or_else(|_| "0.0.0.0".into()),
+            sleep_proxy_image: env::var("HOMESHARD_SLEEP_PROXY_IMAGE")
+                .unwrap_or_else(|_| "homeshard-agent:local".into()),
             game_port_start: env::var("HOMESHARD_GAME_PORT_START")
                 .ok()
                 .and_then(|value| value.parse().ok())
@@ -437,7 +448,7 @@ async fn collect_host_metrics(settings: &Settings) -> Value {
     })
 }
 
-async fn refresh_instance_statuses(pool: &PgPool) -> Result<()> {
+async fn refresh_instance_statuses(pool: &PgPool, settings: &Settings) -> Result<()> {
     let rows = sqlx::query("SELECT id FROM instances WHERE state = 'running'")
         .fetch_all(pool)
         .await?;
@@ -468,26 +479,325 @@ async fn refresh_instance_statuses(pool: &PgPool) -> Result<()> {
             continue;
         };
 
-        sqlx::query(
+        let row = sqlx::query(
             r#"
             UPDATE instances
-            SET status = COALESCE(status, '{}'::jsonb) || jsonb_build_object(
-                'players', $2::int,
-                'maxPlayers', $3::int,
-                'statusUpdatedAt', now()
-            )
+            SET status = CASE
+                WHEN $2::int = 0 THEN
+                    COALESCE(status, '{}'::jsonb) || jsonb_build_object(
+                        'players', $2::int,
+                        'maxPlayers', $3::int,
+                        'statusUpdatedAt', now(),
+                        'idleSince', COALESCE(status->'idleSince', to_jsonb(now()))
+                    )
+                ELSE
+                    (COALESCE(status, '{}'::jsonb) - 'idleSince') || jsonb_build_object(
+                        'players', $2::int,
+                        'maxPlayers', $3::int,
+                        'statusUpdatedAt', now()
+                    )
+                END
             WHERE id = $1 AND state = 'running'
+            RETURNING
+                port,
+                idle_timeout_seconds,
+                EXTRACT(EPOCH FROM (now() - (status->>'idleSince')::timestamptz))::bigint
+                    AS idle_seconds
             "#,
         )
         .bind(instance_id)
         .bind(players)
         .bind(max_players)
-        .execute(pool)
+        .fetch_optional(pool)
         .await?;
 
         info!(%instance_id, players, max_players, "instance player count updated");
+
+        let Some(row) = row else {
+            continue;
+        };
+        let idle_timeout_seconds: i32 = row.get("idle_timeout_seconds");
+        let port: i32 = row.get("port");
+        let idle_seconds: Option<i64> = row.get("idle_seconds");
+        if idle_action(players, idle_seconds, idle_timeout_seconds) == IdleAction::Sleep {
+            if let Err(error) = sleep_idle_instance(pool, settings, instance_id, port, max_players).await {
+                warn!(%instance_id, error = %error, "could not put idle instance to sleep");
+            }
+        }
     }
 
+    refresh_sleeping_proxies(pool, settings).await?;
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum IdleAction {
+    KeepRunning,
+    Sleep,
+}
+
+fn idle_action(players: i32, idle_seconds: Option<i64>, idle_timeout_seconds: i32) -> IdleAction {
+    if players == 0
+        && idle_timeout_seconds > 0
+        && idle_seconds.is_some_and(|elapsed| elapsed >= i64::from(idle_timeout_seconds))
+    {
+        IdleAction::Sleep
+    } else {
+        IdleAction::KeepRunning
+    }
+}
+
+async fn sleep_idle_instance(
+    pool: &PgPool,
+    settings: &Settings,
+    instance_id: Uuid,
+    port: i32,
+    max_players: i32,
+) -> Result<()> {
+    let container = format!("homeshard-{instance_id}");
+    require_managed_container(&container, instance_id).await?;
+    docker(["stop", &container]).await?;
+    if let Err(error) = start_sleep_proxy(settings, instance_id, port, max_players).await {
+        let _ = docker(["start", &container]).await;
+        return Err(error.context("start sleeping proxy"));
+    }
+    sqlx::query(
+        r#"
+        UPDATE instances
+        SET state = 'sleeping',
+            status = (COALESCE(status, '{}'::jsonb) - 'idleSince') || jsonb_build_object(
+                'players', 0,
+                'statusUpdatedAt', NULL
+            ),
+            updated_at = now()
+        WHERE id = $1 AND state = 'running'
+        "#,
+    )
+    .bind(instance_id)
+    .execute(pool)
+    .await?;
+    info!(%instance_id, "instance put to sleep after idle timeout");
+    Ok(())
+}
+
+fn sleep_proxy_name(instance_id: Uuid) -> String {
+    format!("homeshard-sleep-{instance_id}")
+}
+
+async fn start_sleep_proxy(
+    settings: &Settings,
+    instance_id: Uuid,
+    port: i32,
+    max_players: i32,
+) -> Result<()> {
+    let proxy = sleep_proxy_name(instance_id);
+    let _ = docker(["rm", "-f", &proxy]).await;
+    let port_mapping = format!("{}:{port}:25565", settings.game_bind_ip);
+    let instance_label = format!("homeshard.instance_id={instance_id}");
+    let max_players = max_players.max(1).to_string();
+    let args = vec![
+        "run".into(),
+        "-d".into(),
+        "--name".into(),
+        proxy,
+        "--restart".into(),
+        "no".into(),
+        "--label".into(),
+        "homeshard.sleep_proxy=true".into(),
+        "--label".into(),
+        instance_label,
+        "-p".into(),
+        port_mapping,
+        "-e".into(),
+        format!("HOMESHARD_SLEEP_MAX_PLAYERS={max_players}"),
+        settings.sleep_proxy_image.clone(),
+        "sleep-proxy".into(),
+    ];
+    docker_owned(&args).await?;
+    info!(%instance_id, port, "sleeping proxy started");
+    Ok(())
+}
+
+async fn remove_sleep_proxy(instance_id: Uuid) -> Result<()> {
+    let proxy = sleep_proxy_name(instance_id);
+    match docker(["rm", "-f", &proxy]).await {
+        Ok(_) => Ok(()),
+        Err(error) if docker_missing_container(&error) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+async fn sleep_proxy_state(instance_id: Uuid) -> Result<Option<(bool, i64)>> {
+    let proxy = sleep_proxy_name(instance_id);
+    match docker(["inspect", "-f", "{{.State.Running}} {{.State.ExitCode}}", &proxy]).await {
+        Ok(output) => {
+            let mut parts = output.split_whitespace();
+            let running = parts.next() == Some("true");
+            let exit_code = parts.next().and_then(|value| value.parse().ok()).unwrap_or(0);
+            Ok(Some((running, exit_code)))
+        }
+        Err(error) if docker_missing_container(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+async fn refresh_sleeping_proxies(pool: &PgPool, settings: &Settings) -> Result<()> {
+    let rows = sqlx::query(
+        "SELECT id, port, COALESCE((status->>'maxPlayers')::int, 20) AS max_players FROM instances WHERE state = 'sleeping'",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    for row in rows {
+        let instance_id: Uuid = row.get("id");
+        let port: i32 = row.get("port");
+        let max_players: i32 = row.get("max_players");
+        match sleep_proxy_state(instance_id).await? {
+            Some((true, _)) => {}
+            Some((false, 42)) => {
+                remove_sleep_proxy(instance_id).await?;
+                let container = format!("homeshard-{instance_id}");
+                require_managed_container(&container, instance_id).await?;
+                docker(["start", &container]).await?;
+                sqlx::query(
+                    "UPDATE instances SET state = 'running', status = COALESCE(status, '{}'::jsonb) - 'idleSince', updated_at = now() WHERE id = $1 AND state = 'sleeping'",
+                )
+                .bind(instance_id)
+                .execute(pool)
+                .await?;
+                info!(%instance_id, "login attempt woke sleeping instance");
+            }
+            Some((false, exit_code)) => {
+                warn!(%instance_id, exit_code, "sleeping proxy exited; restarting it");
+                start_sleep_proxy(settings, instance_id, port, max_players).await?;
+            }
+            None => start_sleep_proxy(settings, instance_id, port, max_players).await?,
+        }
+    }
+    Ok(())
+}
+
+fn proxy_read_varint(reader: &mut impl Read) -> Result<i32> {
+    let mut result = 0i32;
+    for shift in (0..35).step_by(7) {
+        let mut byte = [0u8; 1];
+        reader.read_exact(&mut byte)?;
+        result |= i32::from(byte[0] & 0x7f) << shift;
+        if byte[0] & 0x80 == 0 {
+            return Ok(result);
+        }
+    }
+    Err(anyhow!("Minecraft VarInt is too large"))
+}
+
+fn proxy_write_varint(mut value: i32, output: &mut Vec<u8>) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value = ((value as u32) >> 7) as i32;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        output.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
+fn proxy_packet(packet_id: i32, payload: &[u8]) -> Vec<u8> {
+    let mut inner = Vec::new();
+    proxy_write_varint(packet_id, &mut inner);
+    inner.extend_from_slice(payload);
+    let mut packet = Vec::new();
+    proxy_write_varint(inner.len() as i32, &mut packet);
+    packet.extend(inner);
+    packet
+}
+
+fn proxy_string(value: &str) -> Vec<u8> {
+    let bytes = value.as_bytes();
+    let mut output = Vec::new();
+    proxy_write_varint(bytes.len() as i32, &mut output);
+    output.extend_from_slice(bytes);
+    output
+}
+
+fn proxy_handle_client(mut stream: TcpStream, max_players: i32) -> Result<bool> {
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let packet_len = proxy_read_varint(&mut stream)?;
+    if !(1..=2_097_152).contains(&packet_len) {
+        return Err(anyhow!("invalid handshake length"));
+    }
+    let mut packet = vec![0u8; packet_len as usize];
+    stream.read_exact(&mut packet)?;
+    let mut cursor = Cursor::new(packet);
+    if proxy_read_varint(&mut cursor)? != 0 {
+        return Ok(false);
+    }
+    let protocol = proxy_read_varint(&mut cursor)?;
+    let address_len = proxy_read_varint(&mut cursor)?;
+    if address_len < 0 {
+        return Err(anyhow!("invalid server address length"));
+    }
+    cursor.set_position(cursor.position() + address_len as u64 + 2);
+    let next_state = proxy_read_varint(&mut cursor)?;
+
+    if next_state == 1 {
+        let request_len = proxy_read_varint(&mut stream)?;
+        let mut request = vec![0u8; request_len.max(0) as usize];
+        stream.read_exact(&mut request)?;
+        let response = json!({
+            "version": { "name": "Sleeping", "protocol": protocol },
+            "players": { "max": max_players, "online": 0, "sample": [] },
+            "description": { "text": "§e☕ Server is sleeping — join to wake it up!" }
+        });
+        stream.write_all(&proxy_packet(0, &proxy_string(&response.to_string())))?;
+        if let Ok(ping_len) = proxy_read_varint(&mut stream) {
+            if (1..=1024).contains(&ping_len) {
+                let mut ping = vec![0u8; ping_len as usize];
+                stream.read_exact(&mut ping)?;
+                let mut pong = Vec::new();
+                proxy_write_varint(ping_len, &mut pong);
+                pong.extend(ping);
+                stream.write_all(&pong)?;
+            }
+        }
+        Ok(false)
+    } else if next_state == 2 {
+        let login_len = proxy_read_varint(&mut stream).unwrap_or(0);
+        if (1..=65_536).contains(&login_len) {
+            let mut login = vec![0u8; login_len as usize];
+            let _ = stream.read_exact(&mut login);
+        }
+        let message = json!({ "text": "§e☕ Server is waking up!\n§fReconnect in a few seconds…" });
+        stream.write_all(&proxy_packet(0, &proxy_string(&message.to_string())))?;
+        stream.flush()?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+fn run_sleep_proxy() -> Result<()> {
+    let max_players = env::var("HOMESHARD_SLEEP_MAX_PLAYERS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(20);
+    let listener = TcpListener::bind(("0.0.0.0", 25565)).context("bind sleeping proxy")?;
+    info!(max_players, "sleeping proxy listening on port 25565");
+    for connection in listener.incoming() {
+        match connection {
+            Ok(stream) => {
+                std::thread::spawn(move || match proxy_handle_client(stream, max_players) {
+                    Ok(true) => process::exit(42),
+                    Ok(false) => {}
+                    Err(error) => warn!(error = %error, "sleeping proxy client failed"),
+                });
+            }
+            Err(error) => warn!(error = %error, "sleeping proxy accept failed"),
+        }
+    }
     Ok(())
 }
 
@@ -653,9 +963,9 @@ async fn handle_command(
     match command.kind.as_str() {
         "create_instance" => create_instance(pool, settings, command).await,
         "retry_deploy" => retry_deploy(pool, settings, command.instance_id).await,
-        "start" => docker_lifecycle(pool, command.instance_id, "start").await,
-        "stop" | "sleep" => docker_lifecycle(pool, command.instance_id, "stop").await,
-        "restart" => docker_lifecycle(pool, command.instance_id, "restart").await,
+        "start" => docker_lifecycle(pool, settings, command.instance_id, "start").await,
+        "stop" | "sleep" => docker_lifecycle(pool, settings, command.instance_id, "stop").await,
+        "restart" => docker_lifecycle(pool, settings, command.instance_id, "restart").await,
         "sync_mods" => sync_instance_mods(pool, settings, command.instance_id).await,
         "set_instance_mods" => {
             set_instance_mods(pool, settings, command.instance_id, command.payload).await
@@ -1889,6 +2199,7 @@ async fn trash_instance(
     let previous_state: String = row.get("state");
 
     let container = format!("homeshard-{instance_id}");
+    remove_sleep_proxy(instance_id).await?;
     let removed_container = remove_managed_container_if_present(&container, instance_id).await?;
     let data_path = move_path_to_trash(
         settings,
@@ -2014,13 +2325,31 @@ async fn move_path_to_trash(
 
 async fn docker_lifecycle(
     pool: &PgPool,
+    settings: &Settings,
     instance_id: Option<Uuid>,
     action: &str,
 ) -> Result<CommandResult> {
     let instance_id = instance_id.ok_or_else(|| anyhow!("instance_id is required"))?;
     let container = format!("homeshard-{instance_id}");
     require_managed_container(&container, instance_id).await?;
+    let row = sqlx::query(
+        "SELECT port, COALESCE((status->>'maxPlayers')::int, 20) AS max_players FROM instances WHERE id = $1",
+    )
+    .bind(instance_id)
+    .fetch_one(pool)
+    .await?;
+    let port: i32 = row.get("port");
+    let max_players: i32 = row.get("max_players");
+    if matches!(action, "start" | "restart") {
+        remove_sleep_proxy(instance_id).await?;
+    }
     docker([action, &container]).await?;
+    if action == "stop" {
+        if let Err(error) = start_sleep_proxy(settings, instance_id, port, max_players).await {
+            let _ = docker(["start", &container]).await;
+            return Err(error.context("start sleeping proxy"));
+        }
+    }
     let state = match action {
         "start" | "restart" => "running",
         "stop" => "sleeping",
@@ -2179,8 +2508,10 @@ async fn sha256_file(path: &PathBuf) -> Result<String> {
 mod tests {
     use super::{
         blocked_mods_from_cf_logs, cf_name_from_url, curseforge_project_id, curseforge_server_ready,
-        modrinth_slug, parse_meminfo, parse_player_count, pick_minecraft_image, slugify,
+        idle_action, modrinth_slug, parse_meminfo, parse_player_count, pick_minecraft_image,
+        proxy_read_varint, proxy_write_varint, slugify, IdleAction,
     };
+    use std::io::Cursor;
 
     #[test]
     fn parses_curseforge_project_id_from_export_url() {
@@ -2255,6 +2586,36 @@ mod tests {
             parse_player_count("There are many of a max of 20 players online:"),
             None
         );
+    }
+
+    #[test]
+    fn idle_timeout_sleeps_when_elapsed() {
+        assert_eq!(idle_action(0, Some(600), 600), IdleAction::Sleep);
+        assert_eq!(idle_action(0, Some(599), 600), IdleAction::KeepRunning);
+    }
+
+    #[test]
+    fn active_players_reset_idle_decision() {
+        assert_eq!(idle_action(1, Some(900), 600), IdleAction::KeepRunning);
+    }
+
+    #[test]
+    fn missing_idle_observation_does_not_sleep() {
+        assert_eq!(idle_action(0, None, 600), IdleAction::KeepRunning);
+    }
+
+    #[test]
+    fn non_positive_idle_timeout_disables_auto_sleep() {
+        assert_eq!(idle_action(0, Some(600), 0), IdleAction::KeepRunning);
+    }
+
+    #[test]
+    fn sleeping_proxy_varints_round_trip() {
+        for value in [0, 1, 127, 128, 25565, 2_097_151] {
+            let mut encoded = Vec::new();
+            proxy_write_varint(value, &mut encoded);
+            assert_eq!(proxy_read_varint(&mut Cursor::new(encoded)).unwrap(), value);
+        }
     }
 
     #[test]
