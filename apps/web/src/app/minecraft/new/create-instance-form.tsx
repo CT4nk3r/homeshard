@@ -1,12 +1,13 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { upload } from "@vercel/blob/client";
 import { FileArchive, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { inspectPack, serverTypeFromLoader, type DetectedServerType } from "@/lib/pack-inspection";
 import type { PackSource } from "@/lib/packs";
 
 type UploadMode = "blob" | "local" | "none";
@@ -30,6 +31,11 @@ export function CreateInstanceForm() {
   const [message, setMessage] = useState<string | null>(null);
   const [missingMessage, setMissingMessage] = useState<string | null>(null);
   const [mode, setMode] = useState<UploadMode>("none");
+  const [serverType, setServerType] = useState<DetectedServerType>("FABRIC");
+  const [gameVersion, setGameVersion] = useState("1.21.1");
+  const [analyzingPack, setAnalyzingPack] = useState(false);
+  const [packMessage, setPackMessage] = useState<string | null>(null);
+  const inspectionSequence = useRef(0);
 
   useEffect(() => {
     fetch("/api/packs/capabilities")
@@ -70,6 +76,39 @@ export function CreateInstanceForm() {
     }
 
     throw new Error("Pack uploads are not configured yet");
+  }
+
+  async function inspectSelectedPack(file?: File) {
+    const sequence = ++inspectionSequence.current;
+    setPackMessage(null);
+    if (!file || file.size === 0) {
+      setAnalyzingPack(false);
+      return;
+    }
+
+    setAnalyzingPack(true);
+    try {
+      if (file.size > 250 * 1024 * 1024) throw new Error("Pack exceeds the 250 MB limit");
+      const summary = inspectPack(new Uint8Array(await file.arrayBuffer()));
+      if (sequence !== inspectionSequence.current) return;
+
+      const detectedType = serverTypeFromLoader(summary.loader);
+      const detectedVersion = summary.minecraftVersion !== "unknown" ? summary.minecraftVersion : null;
+      if (detectedType) setServerType(detectedType);
+      if (detectedVersion) setGameVersion(detectedVersion);
+
+      if (detectedType && detectedVersion) {
+        setPackMessage(`Detected ${detectedType === "NEOFORGE" ? "NeoForge" : detectedType.toLowerCase()} ${detectedVersion} from ${summary.name}.`);
+      } else {
+        setPackMessage(`Read ${summary.name}, but its server type and Minecraft version are not included. Check the selections above.`);
+      }
+    } catch (error) {
+      if (sequence === inspectionSequence.current) {
+        setPackMessage(`${error instanceof Error ? error.message : "Could not inspect pack"}. Check the server type and Minecraft version above.`);
+      }
+    } finally {
+      if (sequence === inspectionSequence.current) setAnalyzingPack(false);
+    }
   }
 
   async function readCommand(id: string): Promise<CommandStatus> {
@@ -167,18 +206,20 @@ export function CreateInstanceForm() {
     <form action={submit} className="space-y-5">
       <div className="space-y-2"><label htmlFor="name" className="text-sm font-medium">Instance name</label><Input id="name" name="name" placeholder="TwoWeekMc" required maxLength={48} /></div>
       <div className="grid gap-4 sm:grid-cols-2">
-        <div className="space-y-2"><label className="text-sm font-medium">Server type</label><Select name="serverType" defaultValue="FABRIC"><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="VANILLA">Vanilla</SelectItem><SelectItem value="PAPER">Paper</SelectItem><SelectItem value="FABRIC">Fabric</SelectItem><SelectItem value="FORGE">Forge</SelectItem><SelectItem value="NEOFORGE">NeoForge</SelectItem></SelectContent></Select></div>
-        <div className="space-y-2"><label htmlFor="gameVersion" className="text-sm font-medium">Minecraft version</label><Input id="gameVersion" name="gameVersion" defaultValue="1.21.1" /></div>
+        <div className="space-y-2"><label className="text-sm font-medium">Server type</label><Select name="serverType" value={serverType} onValueChange={(value) => setServerType(value as DetectedServerType)}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="VANILLA">Vanilla</SelectItem><SelectItem value="PAPER">Paper</SelectItem><SelectItem value="FABRIC">Fabric</SelectItem><SelectItem value="FORGE">Forge</SelectItem><SelectItem value="NEOFORGE">NeoForge</SelectItem></SelectContent></Select></div>
+        <div className="space-y-2"><label htmlFor="gameVersion" className="text-sm font-medium">Minecraft version</label><Input id="gameVersion" name="gameVersion" value={gameVersion} onChange={(event) => setGameVersion(event.target.value)} /></div>
       </div>
-      <div className="space-y-2"><label htmlFor="memoryMb" className="text-sm font-medium">Memory recommendation (MiB)</label><Input id="memoryMb" name="memoryMb" type="number" min="2048" max="12288" step="1024" defaultValue="8192" /></div>
+      <div className="space-y-2"><label htmlFor="memoryMb" className="text-sm font-medium">Memory recommendation (MiB)</label><Input id="memoryMb" name="memoryMb" type="number" min="2048" max="12288" step="1024" defaultValue="4096" /></div>
       <div className="space-y-2"><label htmlFor="levelSeed" className="text-sm font-medium">World seed <span className="text-muted-foreground">(optional)</span></label><Input id="levelSeed" name="levelSeed" placeholder="Leave blank for random" maxLength={128} /></div>
       <div className="space-y-2">
         <label htmlFor="pack" className="text-sm font-medium">Modpack <span className="text-muted-foreground">(optional)</span></label>
-        <Input id="pack" name="pack" type="file" accept=".zip,.mrpack,.json,application/zip,application/json" />
-        <p className="flex items-center gap-1.5 text-xs text-muted-foreground"><FileArchive className="size-3.5" />CurseForge ZIP, Modrinth .mrpack, or a Prism modlist .json export. For a Prism modlist, the server type + Minecraft version above are used to resolve each mod.</p>
+        <Input id="pack" name="pack" type="file" accept=".zip,.mrpack,.json,application/zip,application/json" onChange={(event) => void inspectSelectedPack(event.target.files?.[0])} />
+        <p className="flex items-center gap-1.5 text-xs text-muted-foreground"><FileArchive className="size-3.5" />CurseForge ZIP, Modrinth .mrpack, or a Prism modlist .json export. Pack metadata automatically fills in the server type and Minecraft version when available.</p>
+        {analyzingPack && <p className="flex items-center gap-1.5 text-xs text-muted-foreground"><Loader2 className="size-3.5 animate-spin" />Reading pack metadata...</p>}
+        {!analyzingPack && packMessage && <p className="rounded-md bg-secondary p-3 text-sm">{packMessage}</p>}
       </div>
       {message && <p className="rounded-md bg-secondary p-3 text-sm">{message}</p>}
-      <Button disabled={busy}>{busy && <Loader2 className="size-4 animate-spin" />}{busy ? "Preparing instance..." : "Create instance"}</Button>
+      <Button disabled={busy || analyzingPack}>{(busy || analyzingPack) && <Loader2 className="size-4 animate-spin" />}{busy ? "Preparing instance..." : analyzingPack ? "Reading modpack..." : "Create instance"}</Button>
     </form>
     <form action={uploadMissingMods} className="space-y-3 rounded-lg border p-4">
       <div className="space-y-1">
