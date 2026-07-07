@@ -37,6 +37,7 @@ struct Settings {
     cf_api_key: Option<String>,
     missing_mods_dir: Option<String>,
     cf_install_timeout: Duration,
+    instance_start_timeout: Duration,
     max_concurrent_commands: usize,
     poll_active_ms: u64,
     poll_idle_ms: u64,
@@ -315,6 +316,13 @@ impl Settings {
                     .filter(|secs| *secs > 0)
                     .unwrap_or(1800),
             ),
+            instance_start_timeout: Duration::from_secs(
+                env::var("HOMESHARD_INSTANCE_START_TIMEOUT_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|secs| *secs > 0)
+                    .unwrap_or(1800),
+            ),
             max_concurrent_commands: env::var("HOMESHARD_MAX_CONCURRENT_COMMANDS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -424,6 +432,31 @@ async fn refresh_instance_statuses(pool: &PgPool) -> Result<()> {
     for row in rows {
         let instance_id: Uuid = row.get("id");
         let container = format!("homeshard-{instance_id}");
+        match container_runtime_state(&container).await {
+            Ok(state) if matches!(state.status.as_str(), "exited" | "dead") => {
+                let reason = container_failure_reason(&container, state.exit_code).await;
+                update_instance_state(
+                    pool,
+                    instance_id,
+                    "failed",
+                    json!({
+                        "reason": reason,
+                        "stage": "runtime",
+                        "exitCode": state.exit_code,
+                        "restartCount": state.restart_count,
+                    }),
+                )
+                .await?;
+                warn!(%instance_id, exit_code = state.exit_code, "instance container exited");
+                continue;
+            }
+            Ok(state) if state.status == "restarting" => continue,
+            Ok(_) => {}
+            Err(error) => {
+                warn!(%instance_id, error = %error, "could not inspect instance container");
+                continue;
+            }
+        }
         let result = timeout(
             Duration::from_secs(5),
             docker_exec(&[&container, "rcon-cli", "list"]),
@@ -632,9 +665,9 @@ async fn handle_command(
     match command.kind.as_str() {
         "create_instance" => create_instance(pool, settings, command).await,
         "retry_deploy" => retry_deploy(pool, settings, command.instance_id).await,
-        "start" => docker_lifecycle(pool, command.instance_id, "start").await,
-        "stop" | "sleep" => docker_lifecycle(pool, command.instance_id, "stop").await,
-        "restart" => docker_lifecycle(pool, command.instance_id, "restart").await,
+        "start" => docker_lifecycle(pool, settings, command.instance_id, "start").await,
+        "stop" | "sleep" => docker_lifecycle(pool, settings, command.instance_id, "stop").await,
+        "restart" => docker_lifecycle(pool, settings, command.instance_id, "restart").await,
         "sync_mods" => sync_instance_mods(pool, settings, command.instance_id).await,
         "set_instance_mods" => {
             set_instance_mods(pool, settings, command.instance_id, command.payload).await
@@ -868,6 +901,8 @@ async fn launch_instance(
         "-d".into(),
         "--name".into(),
         container.clone(),
+        "--restart".into(),
+        "on-failure:3".into(),
         "--label".into(),
         "homeshard.managed=true".into(),
         "--label".into(),
@@ -921,11 +956,9 @@ async fn launch_instance(
         .unwrap_or_else(|| game_version.to_string());
     args.push(settings.image_for_minecraft_version(Some(&mc_version)));
     docker_owned(&args).await?;
-    if auto_curseforge {
-        if let Err(error) = await_curseforge_install(settings, &container).await {
-            let _ = docker(["rm", "-f", &container]).await;
-            return Err(error);
-        }
+    if let Err(error) = await_instance_ready(settings, &container, auto_curseforge).await {
+        let _ = docker(["rm", "-f", &container]).await;
+        return Err(error);
     }
     Ok(())
 }
@@ -1191,45 +1224,49 @@ async fn curl_json(url: &str, extra: &[&str]) -> Result<Value> {
     serde_json::from_str(&output).with_context(|| format!("parse JSON from {url}"))
 }
 
-/// Surfaces blocked-mod downloads in Homeshard's standard format and is bounded
-/// so a stuck install can never block the agent forever.
-async fn await_curseforge_install(settings: &Settings, container: &str) -> Result<()> {
-    let deadline = Instant::now() + settings.cf_install_timeout;
+/// Wait until Minecraft is actually accepting work. Docker's on-failure policy
+/// retries transient bootstrap errors; only a final exit becomes a failed command.
+async fn await_instance_ready(
+    settings: &Settings,
+    container: &str,
+    auto_curseforge: bool,
+) -> Result<()> {
+    let startup_timeout = if auto_curseforge {
+        settings.cf_install_timeout
+    } else {
+        settings.instance_start_timeout
+    };
+    let deadline = Instant::now() + startup_timeout;
     loop {
         let logs = container_logs(container, 800).await.unwrap_or_default();
         if let Some(message) = blocked_mods_from_cf_logs(&logs) {
             return Err(anyhow!("{message}"));
         }
-        if curseforge_server_ready(&logs) {
+        if matches!(
+            timeout(
+                Duration::from_secs(5),
+                docker_exec(&[container, "rcon-cli", "list"]),
+            )
+            .await,
+            Ok(Ok(_))
+        ) {
             return Ok(());
         }
-        let (running, exit_code) = container_state(container).await?;
-        if !running {
-            let tail = logs
-                .lines()
-                .rev()
-                .take(20)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>()
-                .join("\n");
+        let state = container_runtime_state(container).await?;
+        if matches!(state.status.as_str(), "exited" | "dead") {
             return Err(anyhow!(
-                "CurseForge install failed (server container exited with code {exit_code}). Recent output:\n{tail}"
+                "{}",
+                container_failure_reason(container, state.exit_code).await
             ));
         }
         if Instant::now() >= deadline {
             return Err(anyhow!(
-                "CurseForge install timed out after {}s",
-                settings.cf_install_timeout.as_secs()
+                "Minecraft startup timed out after {}s",
+                startup_timeout.as_secs()
             ));
         }
         sleep(Duration::from_secs(3)).await;
     }
-}
-
-fn curseforge_server_ready(logs: &str) -> bool {
-    logs.contains("RCON running on") || logs.contains("For help, type") || logs.contains("Done (")
 }
 
 /// Best-effort detection of CurseForge mods that must be downloaded manually,
@@ -1281,16 +1318,58 @@ fn cf_name_from_url(url: &str) -> String {
         .unwrap_or_else(|| url.to_string())
 }
 
-async fn container_state(container: &str) -> Result<(bool, i64)> {
+#[derive(Debug, PartialEq)]
+struct ContainerRuntimeState {
+    status: String,
+    exit_code: i64,
+    restart_count: i64,
+}
+
+async fn container_runtime_state(container: &str) -> Result<ContainerRuntimeState> {
     let output = run_command(
         "docker",
-        &["inspect", "-f", "{{.State.Running}} {{.State.ExitCode}}", container],
+        &[
+            "inspect",
+            "-f",
+            "{{.State.Status}} {{.State.ExitCode}} {{.RestartCount}}",
+            container,
+        ],
     )
     .await?;
+    parse_container_runtime_state(&output)
+}
+
+fn parse_container_runtime_state(output: &str) -> Result<ContainerRuntimeState> {
     let mut parts = output.split_whitespace();
-    let running = parts.next() == Some("true");
+    let status = parts
+        .next()
+        .ok_or_else(|| anyhow!("Docker returned no container status"))?
+        .to_string();
     let exit_code = parts.next().and_then(|value| value.parse().ok()).unwrap_or(0);
-    Ok((running, exit_code))
+    let restart_count = parts.next().and_then(|value| value.parse().ok()).unwrap_or(0);
+    Ok(ContainerRuntimeState {
+        status,
+        exit_code,
+        restart_count,
+    })
+}
+
+async fn container_failure_reason(container: &str, exit_code: i64) -> String {
+    let logs = container_logs(container, 80).await.unwrap_or_default();
+    let tail = logs
+        .lines()
+        .rev()
+        .take(20)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    if tail.is_empty() {
+        format!("Minecraft container exited with code {exit_code} without producing logs")
+    } else {
+        format!("Minecraft container exited with code {exit_code}. Recent output:\n{tail}")
+    }
 }
 
 async fn container_logs(container: &str, lines: u32) -> Result<String> {
@@ -1993,27 +2072,47 @@ async fn move_path_to_trash(
 
 async fn docker_lifecycle(
     pool: &PgPool,
+    settings: &Settings,
     instance_id: Option<Uuid>,
     action: &str,
 ) -> Result<CommandResult> {
     let instance_id = instance_id.ok_or_else(|| anyhow!("instance_id is required"))?;
     let container = format!("homeshard-{instance_id}");
     require_managed_container(&container, instance_id).await?;
-    docker([action, &container]).await?;
-    let state = match action {
-        "start" | "restart" => "running",
-        "stop" => "sleeping",
-        _ => "stopped",
-    };
-    let status_patch = if state == "running" {
-        json!({})
+    let starts_server = matches!(action, "start" | "restart");
+    let state = if starts_server { "running" } else { "sleeping" };
+    if starts_server {
+        merge_instance_state(
+            pool,
+            instance_id,
+            "deploying",
+            json!({ "reason": Value::Null, "players": 0, "statusUpdatedAt": Value::Null }),
+        )
+        .await?;
+        docker(["update", "--restart", "on-failure:3", &container]).await?;
+        docker([action, &container]).await?;
+        if let Err(error) = await_instance_ready(settings, &container, false).await {
+            update_instance_state(
+                pool,
+                instance_id,
+                "failed",
+                json!({ "reason": format!("{error:#}"), "stage": "container_start" }),
+            )
+            .await?;
+            return Err(error);
+        }
     } else {
-        json!({ "players": 0, "statusUpdatedAt": Value::Null })
-    };
+        docker([action, &container]).await?;
+    }
+    let status_patch = json!({
+        "reason": Value::Null,
+        "players": 0,
+        "statusUpdatedAt": Value::Null,
+    });
     merge_instance_state(pool, instance_id, state, status_patch).await?;
     Ok(CommandResult {
         ok: true,
-        message: format!("{action} queued for {instance_id}"),
+        message: format!("{action} completed for {instance_id}"),
         data: json!({ "instanceId": instance_id, "state": state }),
     })
 }
@@ -2155,8 +2254,9 @@ async fn sha256_file(path: &PathBuf) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        blocked_mods_from_cf_logs, cf_name_from_url, curseforge_project_id, curseforge_server_ready,
-        modrinth_slug, parse_meminfo, parse_player_count, pick_minecraft_image, slugify,
+        blocked_mods_from_cf_logs, cf_name_from_url, curseforge_project_id, modrinth_slug,
+        parse_container_runtime_state, parse_meminfo, parse_player_count, pick_minecraft_image,
+        slugify, ContainerRuntimeState,
     };
 
     #[test]
@@ -2272,9 +2372,14 @@ mod tests {
     }
 
     #[test]
-    fn curseforge_server_ready_detects_startup() {
-        assert!(curseforge_server_ready("Done (12.3s)! For help, type \"help\""));
-        assert!(curseforge_server_ready("[15:00:00] [Server thread]: RCON running on 0.0.0.0:25575"));
-        assert!(!curseforge_server_ready("Downloading mods (12/175)"));
+    fn parses_docker_runtime_state() {
+        assert_eq!(
+            parse_container_runtime_state("exited 2 3").unwrap(),
+            ContainerRuntimeState {
+                status: "exited".into(),
+                exit_code: 2,
+                restart_count: 3,
+            }
+        );
     }
 }

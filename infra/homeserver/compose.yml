@@ -101,6 +101,7 @@ services:
       # Shown in the dashboard; leave blank to display a placeholder.
       HOMESHARD_MAGIC_DNS: ${HOMESHARD_MAGIC_DNS:-}
       HOMESHARD_INSTANCE_STATUS_INTERVAL_SECS: ${HOMESHARD_INSTANCE_STATUS_INTERVAL_SECS:-15}
+      HOMESHARD_INSTANCE_START_TIMEOUT_SECS: ${HOMESHARD_INSTANCE_START_TIMEOUT_SECS:-1800}
       # IP that game container ports bind to on the host. Use your Tailscale IP
       # to keep servers private, or 0.0.0.0 to expose on all interfaces.
       HOMESHARD_GAME_BIND_IP: ${HOMESHARD_GAME_BIND_IP:-0.0.0.0}
