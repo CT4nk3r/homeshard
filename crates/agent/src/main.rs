@@ -722,14 +722,18 @@ fn proxy_string(value: &str) -> Vec<u8> {
     output
 }
 
+fn proxy_packet_length(length: i32, maximum: i32) -> Result<usize> {
+    if !(1..=maximum).contains(&length) {
+        return Err(anyhow!("invalid proxy packet length: {length}"));
+    }
+    Ok(length as usize)
+}
+
 fn proxy_handle_client(mut stream: TcpStream, max_players: i32) -> Result<bool> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let packet_len = proxy_read_varint(&mut stream)?;
-    if !(1..=2_097_152).contains(&packet_len) {
-        return Err(anyhow!("invalid handshake length"));
-    }
-    let mut packet = vec![0u8; packet_len as usize];
+    let mut packet = vec![0u8; proxy_packet_length(packet_len, 2_097_152)?];
     stream.read_exact(&mut packet)?;
     let mut cursor = Cursor::new(packet);
     if proxy_read_varint(&mut cursor)? != 0 {
@@ -745,7 +749,7 @@ fn proxy_handle_client(mut stream: TcpStream, max_players: i32) -> Result<bool> 
 
     if next_state == 1 {
         let request_len = proxy_read_varint(&mut stream)?;
-        let mut request = vec![0u8; request_len.max(0) as usize];
+        let mut request = vec![0u8; proxy_packet_length(request_len, 1024)?];
         stream.read_exact(&mut request)?;
         let response = json!({
             "version": { "name": "Sleeping", "protocol": protocol },
@@ -964,7 +968,8 @@ async fn handle_command(
         "create_instance" => create_instance(pool, settings, command).await,
         "retry_deploy" => retry_deploy(pool, settings, command.instance_id).await,
         "start" => docker_lifecycle(pool, settings, command.instance_id, "start").await,
-        "stop" | "sleep" => docker_lifecycle(pool, settings, command.instance_id, "stop").await,
+        "stop" => docker_lifecycle(pool, settings, command.instance_id, "stop").await,
+        "sleep" => docker_lifecycle(pool, settings, command.instance_id, "sleep").await,
         "restart" => docker_lifecycle(pool, settings, command.instance_id, "restart").await,
         "sync_mods" => sync_instance_mods(pool, settings, command.instance_id).await,
         "set_instance_mods" => {
@@ -2340,21 +2345,17 @@ async fn docker_lifecycle(
     .await?;
     let port: i32 = row.get("port");
     let max_players: i32 = row.get("max_players");
-    if matches!(action, "start" | "restart") {
+    let (docker_action, state, start_proxy) = lifecycle_plan(action)?;
+    if !start_proxy {
         remove_sleep_proxy(instance_id).await?;
     }
-    docker([action, &container]).await?;
-    if action == "stop" {
+    docker([docker_action, &container]).await?;
+    if start_proxy {
         if let Err(error) = start_sleep_proxy(settings, instance_id, port, max_players).await {
             let _ = docker(["start", &container]).await;
             return Err(error.context("start sleeping proxy"));
         }
     }
-    let state = match action {
-        "start" | "restart" => "running",
-        "stop" => "sleeping",
-        _ => "stopped",
-    };
     let status_patch = if state == "running" {
         json!({})
     } else {
@@ -2366,6 +2367,16 @@ async fn docker_lifecycle(
         message: format!("{action} queued for {instance_id}"),
         data: json!({ "instanceId": instance_id, "state": state }),
     })
+}
+
+fn lifecycle_plan(action: &str) -> Result<(&'static str, &'static str, bool)> {
+    match action {
+        "start" => Ok(("start", "running", false)),
+        "restart" => Ok(("restart", "running", false)),
+        "stop" => Ok(("stop", "stopped", false)),
+        "sleep" => Ok(("stop", "sleeping", true)),
+        _ => Err(anyhow!("unsupported lifecycle action: {action}")),
+    }
 }
 
 async fn merge_instance_state(
@@ -2507,9 +2518,10 @@ async fn sha256_file(path: &PathBuf) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        blocked_mods_from_cf_logs, cf_name_from_url, curseforge_project_id, curseforge_server_ready,
-        idle_action, modrinth_slug, parse_meminfo, parse_player_count, pick_minecraft_image,
-        proxy_read_varint, proxy_write_varint, slugify, IdleAction,
+        blocked_mods_from_cf_logs, cf_name_from_url, curseforge_project_id,
+        curseforge_server_ready, idle_action, lifecycle_plan, modrinth_slug, parse_meminfo,
+        parse_player_count, pick_minecraft_image, proxy_packet_length, proxy_read_varint,
+        proxy_write_varint, slugify, IdleAction,
     };
     use std::io::Cursor;
 
@@ -2616,6 +2628,28 @@ mod tests {
             proxy_write_varint(value, &mut encoded);
             assert_eq!(proxy_read_varint(&mut Cursor::new(encoded)).unwrap(), value);
         }
+    }
+
+    #[test]
+    fn sleeping_proxy_rejects_unbounded_packet_lengths() {
+        assert_eq!(proxy_packet_length(1, 1024).unwrap(), 1);
+        assert_eq!(proxy_packet_length(1024, 1024).unwrap(), 1024);
+        assert!(proxy_packet_length(0, 1024).is_err());
+        assert!(proxy_packet_length(-1, 1024).is_err());
+        assert!(proxy_packet_length(1025, 1024).is_err());
+    }
+
+    #[test]
+    fn stop_and_sleep_have_distinct_lifecycle_plans() {
+        assert_eq!(
+            lifecycle_plan("stop").unwrap(),
+            ("stop", "stopped", false)
+        );
+        assert_eq!(
+            lifecycle_plan("sleep").unwrap(),
+            ("stop", "sleeping", true)
+        );
+        assert!(lifecycle_plan("invalid").is_err());
     }
 
     #[test]

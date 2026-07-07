@@ -105,7 +105,7 @@ services:
       HOMESHARD_AGENT_ID: ${HOMESHARD_AGENT_ID:-homeserver}
       # The agent image doubles as the lightweight fake Minecraft server while
       # an instance sleeps. Override when using a custom image tag.
-      HOMESHARD_SLEEP_PROXY_IMAGE: ${HOMESHARD_SLEEP_PROXY_IMAGE:-homeshard-agent}
+      HOMESHARD_SLEEP_PROXY_IMAGE: ${HOMESHARD_SLEEP_PROXY_IMAGE:-homeshard-agent:local}
       # Hostname/IP players use to connect (e.g. a Tailscale MagicDNS name).
       # Shown in the dashboard; leave blank to display a placeholder.
       HOMESHARD_MAGIC_DNS: ${HOMESHARD_MAGIC_DNS:-}

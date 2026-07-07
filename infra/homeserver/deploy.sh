@@ -35,6 +35,7 @@ else
 
   export HOMESHARD_WEB_IMAGE="${repository}-web:${release}"
   export HOMESHARD_AGENT_IMAGE="${repository}-agent:${release}"
+  export HOMESHARD_SLEEP_PROXY_IMAGE="$HOMESHARD_AGENT_IMAGE"
   "${compose[@]}" pull web agent
   "${compose[@]}" up -d --no-build --wait --wait-timeout 180
 fi
