@@ -10,7 +10,7 @@ RUN touch crates/agent/src/main.rs \
 
 FROM debian:bookworm-slim AS runner
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates curl docker.io unzip \
+  && apt-get install -y --no-install-recommends ca-certificates curl docker.io gzip tar unzip \
   && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /source/target/release/homeshard-agent /usr/local/bin/homeshard-agent
 ENTRYPOINT ["homeshard-agent"]

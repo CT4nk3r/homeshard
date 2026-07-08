@@ -1,14 +1,16 @@
 use anyhow::{anyhow, Context, Result};
+use chrono::{DateTime, Timelike, Utc};
+use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     env,
     io::{Cursor, Read, Write},
     net::{TcpListener, TcpStream},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -43,10 +45,14 @@ struct Settings {
     cf_api_key: Option<String>,
     missing_mods_dir: Option<String>,
     cf_install_timeout: Duration,
+    instance_start_timeout: Duration,
     max_concurrent_commands: usize,
     poll_active_ms: u64,
     poll_idle_ms: u64,
     instance_status_interval: Duration,
+    backup_timezone: Tz,
+    backup_hour: u32,
+    scheduled_backup_retention: usize,
 }
 
 #[derive(Debug)]
@@ -105,6 +111,11 @@ struct AddInstanceModPayload {
 }
 
 #[derive(Debug, Deserialize)]
+struct DeleteInstanceModPayload {
+    filename: String,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 enum InstanceModSource {
     Local {
@@ -125,6 +136,30 @@ enum InstanceModSource {
 #[derive(Debug, Deserialize)]
 struct ConsolePayload {
     command: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BackupInstancePayload {
+    #[serde(rename = "backupKind")]
+    backup_kind: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegenerateWorldPayload {
+    seed: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RestoreBackupPayload {
+    #[serde(rename = "backupId")]
+    backup_id: Uuid,
+}
+
+#[derive(Debug)]
+struct CreatedBackup {
+    id: Uuid,
+    size_bytes: u64,
+    world_seed: Option<String>,
 }
 
 #[derive(Debug)]
@@ -183,6 +218,7 @@ async fn main() -> Result<()> {
     tokio::fs::create_dir_all(settings.cold_root.join("packs")).await?;
     tokio::fs::create_dir_all(settings.cold_root.join("trash")).await?;
     tokio::fs::create_dir_all(settings.cold_root.join("imports")).await?;
+    tokio::fs::create_dir_all(settings.cold_root.join("backups")).await?;
     tokio::fs::create_dir_all(&settings.staging_root).await?;
 
     let pool = PgPoolOptions::new()
@@ -206,6 +242,9 @@ async fn main() -> Result<()> {
     let mut last_heartbeat = Instant::now();
     let mut last_instance_status = Instant::now()
         .checked_sub(settings.instance_status_interval)
+        .unwrap_or_else(Instant::now);
+    let mut last_backup_schedule = Instant::now()
+        .checked_sub(Duration::from_secs(60))
         .unwrap_or_else(Instant::now);
 
     loop {
@@ -232,6 +271,13 @@ async fn main() -> Result<()> {
                 });
             }
             last_instance_status = Instant::now();
+        }
+
+        if last_backup_schedule.elapsed() >= Duration::from_secs(60) {
+            if let Err(error) = schedule_sleeping_backups(&pool, &settings).await {
+                warn!(error = %error, "daily backup scheduling failed");
+            }
+            last_backup_schedule = Instant::now();
         }
 
         // Cap how many commands run at once. The claim query already prevents
@@ -336,6 +382,13 @@ impl Settings {
                     .filter(|secs| *secs > 0)
                     .unwrap_or(1800),
             ),
+            instance_start_timeout: Duration::from_secs(
+                env::var("HOMESHARD_INSTANCE_START_TIMEOUT_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|secs| *secs > 0)
+                    .unwrap_or(1800),
+            ),
             max_concurrent_commands: env::var("HOMESHARD_MAX_CONCURRENT_COMMANDS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -356,6 +409,20 @@ impl Settings {
                     .filter(|seconds| *seconds > 0)
                     .unwrap_or(15),
             ),
+            backup_timezone: env::var("HOMESHARD_BACKUP_TIMEZONE")
+                .unwrap_or_else(|_| "Europe/Budapest".into())
+                .parse()
+                .context("HOMESHARD_BACKUP_TIMEZONE must be a valid IANA timezone")?,
+            backup_hour: env::var("HOMESHARD_BACKUP_HOUR")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .filter(|hour| *hour < 24)
+                .unwrap_or(6),
+            scheduled_backup_retention: env::var("HOMESHARD_SCHEDULED_BACKUP_RETENTION")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .filter(|count| *count > 0)
+                .unwrap_or(14),
         })
         .and_then(|settings| {
             if !(1..=65535).contains(&settings.game_port_start)
@@ -380,7 +447,9 @@ impl Settings {
 
 fn pick_minecraft_image(default_image: &str, modern_image: &str, version: Option<&str>) -> String {
     match version.map(str::trim) {
-        Some(version) if !version.is_empty() && !version.starts_with("1.") => modern_image.to_string(),
+        Some(version) if !version.is_empty() && !version.starts_with("1.") => {
+            modern_image.to_string()
+        }
         _ => default_image.to_string(),
     }
 }
@@ -456,6 +525,31 @@ async fn refresh_instance_statuses(pool: &PgPool, settings: &Settings) -> Result
     for row in rows {
         let instance_id: Uuid = row.get("id");
         let container = format!("homeshard-{instance_id}");
+        match container_runtime_state(&container).await {
+            Ok(state) if matches!(state.status.as_str(), "exited" | "dead") => {
+                let reason = container_failure_reason(&container, state.exit_code).await;
+                update_instance_state(
+                    pool,
+                    instance_id,
+                    "failed",
+                    json!({
+                        "reason": reason,
+                        "stage": "runtime",
+                        "exitCode": state.exit_code,
+                        "restartCount": state.restart_count,
+                    }),
+                )
+                .await?;
+                warn!(%instance_id, exit_code = state.exit_code, "instance container exited");
+                continue;
+            }
+            Ok(state) if state.status == "restarting" => continue,
+            Ok(_) => {}
+            Err(error) => {
+                warn!(%instance_id, error = %error, "could not inspect instance container");
+                continue;
+            }
+        }
         let result = timeout(
             Duration::from_secs(5),
             docker_exec(&[&container, "rcon-cli", "list"]),
@@ -520,7 +614,9 @@ async fn refresh_instance_statuses(pool: &PgPool, settings: &Settings) -> Result
         let port: i32 = row.get("port");
         let idle_seconds: Option<i64> = row.get("idle_seconds");
         if idle_action(players, idle_seconds, idle_timeout_seconds) == IdleAction::Sleep {
-            if let Err(error) = sleep_idle_instance(pool, settings, instance_id, port, max_players).await {
+            if let Err(error) =
+                sleep_idle_instance(pool, settings, instance_id, port, max_players).await
+            {
                 warn!(%instance_id, error = %error, "could not put idle instance to sleep");
             }
         }
@@ -629,11 +725,21 @@ async fn remove_sleep_proxy(instance_id: Uuid) -> Result<()> {
 
 async fn sleep_proxy_state(instance_id: Uuid) -> Result<Option<(bool, i64)>> {
     let proxy = sleep_proxy_name(instance_id);
-    match docker(["inspect", "-f", "{{.State.Running}} {{.State.ExitCode}}", &proxy]).await {
+    match docker([
+        "inspect",
+        "-f",
+        "{{.State.Running}} {{.State.ExitCode}}",
+        &proxy,
+    ])
+    .await
+    {
         Ok(output) => {
             let mut parts = output.split_whitespace();
             let running = parts.next() == Some("true");
-            let exit_code = parts.next().and_then(|value| value.parse().ok()).unwrap_or(0);
+            let exit_code = parts
+                .next()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
             Ok(Some((running, exit_code)))
         }
         Err(error) if docker_missing_container(&error) => Ok(None),
@@ -809,7 +915,10 @@ fn parse_player_count(output: &str) -> Option<(i32, i32)> {
     let (_, after_prefix) = output.split_once("There are ")?;
     let (players, after_players) = after_prefix.split_once(" of a max of ")?;
     let (max_players, _) = after_players.split_once(" players online")?;
-    Some((players.trim().parse().ok()?, max_players.trim().parse().ok()?))
+    Some((
+        players.trim().parse().ok()?,
+        max_players.trim().parse().ok()?,
+    ))
 }
 
 fn parse_meminfo(contents: &str) -> Option<(f64, f64)> {
@@ -832,7 +941,7 @@ fn kib_to_gib(value: u64) -> f64 {
     ((value as f64 / 1024.0 / 1024.0) * 10.0).round() / 10.0
 }
 
-async fn disk_free_gb(path: &PathBuf) -> Result<f64> {
+async fn disk_free_gb(path: &Path) -> Result<f64> {
     let output = run_command(
         "df",
         &["-B1", "--output=avail", &path.display().to_string()],
@@ -847,7 +956,7 @@ async fn disk_free_gb(path: &PathBuf) -> Result<f64> {
     Ok(bytes_to_gib(bytes))
 }
 
-async fn directory_size_gb(path: &PathBuf) -> Result<f64> {
+async fn directory_size_gb(path: &Path) -> Result<f64> {
     let output = run_command("du", &["-sb", &path.display().to_string()]).await?;
     let bytes = output
         .split_whitespace()
@@ -859,6 +968,46 @@ async fn directory_size_gb(path: &PathBuf) -> Result<f64> {
 
 fn bytes_to_gib(value: u64) -> f64 {
     ((value as f64 / 1024.0 / 1024.0 / 1024.0) * 10.0).round() / 10.0
+}
+
+async fn schedule_sleeping_backups(pool: &PgPool, settings: &Settings) -> Result<()> {
+    let local_now = Utc::now().with_timezone(&settings.backup_timezone);
+    let Some(schedule_date) = backup_schedule_date(local_now, settings.backup_hour) else {
+        return Ok(());
+    };
+    let result = sqlx::query(
+        r#"
+        INSERT INTO commands (instance_id, kind, payload)
+        SELECT i.id,
+               'backup_instance',
+               jsonb_build_object('backupKind', 'scheduled', 'scheduleDate', $1::text)
+        FROM instances i
+        WHERE i.state = 'sleeping'
+          AND NOT EXISTS (
+            SELECT 1 FROM commands c
+            WHERE c.instance_id = i.id
+              AND c.kind = 'backup_instance'
+              AND c.payload->>'scheduleDate' = $1
+          )
+        "#,
+    )
+    .bind(&schedule_date)
+    .execute(pool)
+    .await?;
+    if result.rows_affected() > 0 {
+        info!(
+            count = result.rows_affected(),
+            date = %schedule_date,
+            timezone = %settings.backup_timezone,
+            hour = settings.backup_hour,
+            "queued daily backups for sleeping instances"
+        );
+    }
+    Ok(())
+}
+
+fn backup_schedule_date(local_now: DateTime<Tz>, backup_hour: u32) -> Option<String> {
+    (local_now.hour() >= backup_hour).then(|| local_now.date_naive().to_string())
 }
 
 async fn claim_command(pool: &PgPool, settings: &Settings) -> Result<Option<ClaimedCommand>> {
@@ -953,7 +1102,10 @@ async fn recover_orphaned_commands(pool: &PgPool, settings: &Settings) -> Result
     .await?;
     let recovered = result.rows_affected();
     if recovered > 0 {
-        warn!(count = recovered, "failed orphaned in-progress commands from a previous run");
+        warn!(
+            count = recovered,
+            "failed orphaned in-progress commands from a previous run"
+        );
     }
     Ok(())
 }
@@ -977,6 +1129,18 @@ async fn handle_command(
         }
         "add_instance_mod" => {
             add_instance_mod(pool, settings, command.instance_id, command.payload).await
+        }
+        "delete_instance_mod" => {
+            delete_instance_mod(pool, settings, command.instance_id, command.payload).await
+        }
+        "backup_instance" => {
+            backup_instance(pool, settings, command.instance_id, command.payload).await
+        }
+        "regenerate_world" => {
+            regenerate_world(pool, settings, command.instance_id, command.payload).await
+        }
+        "restore_backup" => {
+            restore_backup(pool, settings, command.instance_id, command.payload).await
         }
         "trash" | "delete_instance" => trash_instance(pool, settings, command.instance_id).await,
         "console" => run_console_command(pool, command.instance_id, command.payload).await,
@@ -1183,6 +1347,7 @@ async fn retry_deploy(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn launch_instance(
     settings: &Settings,
     instance_id: Uuid,
@@ -1204,6 +1369,8 @@ async fn launch_instance(
         "-d".into(),
         "--name".into(),
         container.clone(),
+        "--restart".into(),
+        "on-failure:3".into(),
         "--label".into(),
         "homeshard.managed=true".into(),
         "--label".into(),
@@ -1257,11 +1424,9 @@ async fn launch_instance(
         .unwrap_or_else(|| game_version.to_string());
     args.push(settings.image_for_minecraft_version(Some(&mc_version)));
     docker_owned(&args).await?;
-    if auto_curseforge {
-        if let Err(error) = await_curseforge_install(settings, &container).await {
-            let _ = docker(["rm", "-f", &container]).await;
-            return Err(error);
-        }
+    if let Err(error) = await_instance_ready(settings, &container, auto_curseforge).await {
+        let _ = docker(["rm", "-f", &container]).await;
+        return Err(error);
     }
     Ok(())
 }
@@ -1314,7 +1479,10 @@ async fn read_prism_modlist(path: &Path) -> Option<Vec<ModlistEntry>> {
     let text = tokio::fs::read_to_string(path).await.ok()?;
     let mods: Vec<ModlistEntry> = serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()?;
     // Require at least one entry that actually looks like a mod reference.
-    if mods.iter().any(|entry| entry.filename.is_some() && !entry.url.is_empty()) {
+    if mods
+        .iter()
+        .any(|entry| entry.filename.is_some() && !entry.url.is_empty())
+    {
         Some(mods)
     } else {
         None
@@ -1331,10 +1499,9 @@ async fn add_prism_modlist_arguments(
     server_type: &str,
     game_version: &str,
 ) -> Result<()> {
-    let cf_api_key = settings
-        .cf_api_key
-        .clone()
-        .ok_or_else(|| anyhow!("Prism modlists with CurseForge mods require a CurseForge API key; set CF_API_KEY"))?;
+    let cf_api_key = settings.cf_api_key.clone().ok_or_else(|| {
+        anyhow!("Prism modlists with CurseForge mods require a CurseForge API key; set CF_API_KEY")
+    })?;
     let mods: Vec<ModlistEntry> = pack
         .manifest
         .get("homeshardModlist")
@@ -1384,10 +1551,16 @@ async fn add_prism_modlist_arguments(
         format!("CF_API_KEY={cf_api_key}"),
     ]);
     if !cf_refs.is_empty() {
-        args.extend(["-e".into(), format!("CURSEFORGE_FILES={}", cf_refs.join(","))]);
+        args.extend([
+            "-e".into(),
+            format!("CURSEFORGE_FILES={}", cf_refs.join(",")),
+        ]);
     }
     if !mr_refs.is_empty() {
-        args.extend(["-e".into(), format!("MODRINTH_PROJECTS={}", mr_refs.join(","))]);
+        args.extend([
+            "-e".into(),
+            format!("MODRINTH_PROJECTS={}", mr_refs.join(",")),
+        ]);
     }
     if let Some(dir) = settings.missing_mods_dir.as_deref() {
         args.extend(["-v".into(), format!("{dir}:/downloads/mods:ro")]);
@@ -1467,7 +1640,11 @@ async fn resolve_curseforge_file_id(
         let body = curl_json(&url, &["-H", &format!("x-api-key: {cf_api_key}")])
             .await
             .map_err(|error| error.to_string())?;
-        let files = body.get("data").and_then(Value::as_array).cloned().unwrap_or_default();
+        let files = body
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
         for file in &files {
             if file.get("fileName").and_then(Value::as_str) == Some(filename) {
                 return file
@@ -1488,8 +1665,12 @@ async fn resolve_modrinth_version(
     filename: &str,
 ) -> std::result::Result<String, String> {
     let url = format!("https://api.modrinth.com/v2/project/{slug}/version");
-    let body = curl_json(&url, &[]).await.map_err(|error| error.to_string())?;
-    let versions = body.as_array().ok_or_else(|| "malformed Modrinth response".to_string())?;
+    let body = curl_json(&url, &[])
+        .await
+        .map_err(|error| error.to_string())?;
+    let versions = body
+        .as_array()
+        .ok_or_else(|| "malformed Modrinth response".to_string())?;
     for version in versions {
         let Some(files) = version.get("files").and_then(Value::as_array) else {
             continue;
@@ -1527,45 +1708,49 @@ async fn curl_json(url: &str, extra: &[&str]) -> Result<Value> {
     serde_json::from_str(&output).with_context(|| format!("parse JSON from {url}"))
 }
 
-/// Surfaces blocked-mod downloads in Homeshard's standard format and is bounded
-/// so a stuck install can never block the agent forever.
-async fn await_curseforge_install(settings: &Settings, container: &str) -> Result<()> {
-    let deadline = Instant::now() + settings.cf_install_timeout;
+/// Wait until Minecraft is actually ready. Docker's on-failure policy retries
+/// transient bootstrap errors; only a final exit becomes a failed command.
+async fn await_instance_ready(
+    settings: &Settings,
+    container: &str,
+    auto_curseforge: bool,
+) -> Result<()> {
+    let startup_timeout = if auto_curseforge {
+        settings.cf_install_timeout
+    } else {
+        settings.instance_start_timeout
+    };
+    let deadline = Instant::now() + startup_timeout;
     loop {
         let logs = container_logs(container, 800).await.unwrap_or_default();
         if let Some(message) = blocked_mods_from_cf_logs(&logs) {
             return Err(anyhow!("{message}"));
         }
-        if curseforge_server_ready(&logs) {
+        if matches!(
+            timeout(
+                Duration::from_secs(5),
+                docker_exec(&[container, "rcon-cli", "list"]),
+            )
+            .await,
+            Ok(Ok(_))
+        ) {
             return Ok(());
         }
-        let (running, exit_code) = container_state(container).await?;
-        if !running {
-            let tail = logs
-                .lines()
-                .rev()
-                .take(20)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>()
-                .join("\n");
+        let state = container_runtime_state(container).await?;
+        if matches!(state.status.as_str(), "exited" | "dead") {
             return Err(anyhow!(
-                "CurseForge install failed (server container exited with code {exit_code}). Recent output:\n{tail}"
+                "{}",
+                container_failure_reason(container, state.exit_code).await
             ));
         }
         if Instant::now() >= deadline {
             return Err(anyhow!(
-                "CurseForge install timed out after {}s",
-                settings.cf_install_timeout.as_secs()
+                "Minecraft startup timed out after {}s",
+                startup_timeout.as_secs()
             ));
         }
         sleep(Duration::from_secs(3)).await;
     }
-}
-
-fn curseforge_server_ready(logs: &str) -> bool {
-    logs.contains("RCON running on") || logs.contains("For help, type") || logs.contains("Done (")
 }
 
 /// Best-effort detection of CurseForge mods that must be downloaded manually,
@@ -1582,11 +1767,12 @@ fn blocked_mods_from_cf_logs(logs: &str) -> Option<String> {
     }
     let mut seen = HashSet::new();
     let mut mods: Vec<(String, String)> = Vec::new();
-    for raw in logs.split(|c: char| {
-        c.is_whitespace() || matches!(c, '(' | ')' | '"' | '\'' | ',' | '<' | '>')
-    }) {
-        let url = raw.trim_end_matches(|c: char| matches!(c, '.' | ',' | ')' | ']' | '>' | ':'));
-        if (url.starts_with("https://www.curseforge.com/") || url.starts_with("https://curseforge.com/"))
+    for raw in logs
+        .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '"' | '\'' | ',' | '<' | '>'))
+    {
+        let url = raw.trim_end_matches(['.', ',', ')', ']', '>', ':']);
+        if (url.starts_with("https://www.curseforge.com/")
+            || url.starts_with("https://curseforge.com/"))
             && seen.insert(url.to_string())
         {
             mods.push((cf_name_from_url(url), url.to_string()));
@@ -1600,7 +1786,9 @@ fn blocked_mods_from_cf_logs(logs: &str) -> Option<String> {
     for (name, url) in &mods {
         message.push_str(&format!("Blocked mod: {name}\nDownload: {url}\n"));
     }
-    message.push_str("Download each file from CurseForge, add it through Homeshard, then retry deploy.");
+    message.push_str(
+        "Download each file from CurseForge, add it through Homeshard, then retry deploy.",
+    );
     Some(message)
 }
 
@@ -1617,16 +1805,64 @@ fn cf_name_from_url(url: &str) -> String {
         .unwrap_or_else(|| url.to_string())
 }
 
-async fn container_state(container: &str) -> Result<(bool, i64)> {
+#[derive(Debug, PartialEq)]
+struct ContainerRuntimeState {
+    status: String,
+    exit_code: i64,
+    restart_count: i64,
+}
+
+async fn container_runtime_state(container: &str) -> Result<ContainerRuntimeState> {
     let output = run_command(
         "docker",
-        &["inspect", "-f", "{{.State.Running}} {{.State.ExitCode}}", container],
+        &[
+            "inspect",
+            "-f",
+            "{{.State.Status}} {{.State.ExitCode}} {{.RestartCount}}",
+            container,
+        ],
     )
     .await?;
+    parse_container_runtime_state(&output)
+}
+
+fn parse_container_runtime_state(output: &str) -> Result<ContainerRuntimeState> {
     let mut parts = output.split_whitespace();
-    let running = parts.next() == Some("true");
-    let exit_code = parts.next().and_then(|value| value.parse().ok()).unwrap_or(0);
-    Ok((running, exit_code))
+    let status = parts
+        .next()
+        .ok_or_else(|| anyhow!("Docker returned no container status"))?
+        .to_string();
+    let exit_code = parts
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let restart_count = parts
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    Ok(ContainerRuntimeState {
+        status,
+        exit_code,
+        restart_count,
+    })
+}
+
+async fn container_failure_reason(container: &str, exit_code: i64) -> String {
+    let logs = container_logs(container, 80).await.unwrap_or_default();
+    let tail = logs
+        .lines()
+        .rev()
+        .take(20)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    if tail.is_empty() {
+        format!("Minecraft container exited with code {exit_code} without producing logs")
+    } else {
+        format!("Minecraft container exited with code {exit_code}. Recent output:\n{tail}")
+    }
 }
 
 async fn container_logs(container: &str, lines: u32) -> Result<String> {
@@ -1691,10 +1927,11 @@ async fn set_instance_mods(
             if move_mod_file(&mods_dir, &disabled_dir, &mod_file.filename).await? {
                 moved_to_disabled += 1;
             }
-        } else if !mod_file.enabled && !disabled.contains(&mod_file.filename) {
-            if move_mod_file(&disabled_dir, &mods_dir, &mod_file.filename).await? {
-                moved_to_enabled += 1;
-            }
+        } else if !mod_file.enabled
+            && !disabled.contains(&mod_file.filename)
+            && move_mod_file(&disabled_dir, &mods_dir, &mod_file.filename).await?
+        {
+            moved_to_enabled += 1;
         }
     }
 
@@ -1761,6 +1998,57 @@ async fn add_instance_mod(
             "instanceId": instance_id,
             "filename": filename,
             "sizeBytes": size_bytes,
+            "mods": mods.len(),
+            "restarted": state == "running",
+        }),
+    })
+}
+
+async fn delete_instance_mod(
+    pool: &PgPool,
+    settings: &Settings,
+    instance_id: Option<Uuid>,
+    payload: Value,
+) -> Result<CommandResult> {
+    let instance_id = instance_id.ok_or_else(|| anyhow!("instance_id is required"))?;
+    let state = instance_state(pool, instance_id).await?;
+    let payload: DeleteInstanceModPayload =
+        serde_json::from_value(payload).context("invalid delete_instance_mod payload")?;
+    let filename = sanitize_mod_filename(&payload.filename)?;
+    let data_dir = settings.active_root.join(instance_id.to_string());
+    let mut removed = false;
+    for directory in ["mods", "mods_disabled"] {
+        match tokio::fs::remove_file(data_dir.join(directory).join(&filename)).await {
+            Ok(()) => removed = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if !removed {
+        return Err(anyhow!("mod '{filename}' does not exist on this instance"));
+    }
+
+    let mods = scan_instance_mods(settings, instance_id).await?;
+    persist_instance_mods(pool, instance_id, &mods).await?;
+    if state == "running" {
+        let container = format!("homeshard-{instance_id}");
+        require_managed_container(&container, instance_id).await?;
+        docker(["restart", &container]).await?;
+    }
+
+    Ok(CommandResult {
+        ok: true,
+        message: format!(
+            "Deleted {filename}{}",
+            if state == "running" {
+                " and restarted the instance"
+            } else {
+                ""
+            }
+        ),
+        data: json!({
+            "instanceId": instance_id,
+            "filename": filename,
             "mods": mods.len(),
             "restarted": state == "running",
         }),
@@ -2141,10 +2429,13 @@ async fn ingest_pack(
     })
 }
 
-async fn inspect_pack_archive(path: &PathBuf) -> Result<(Value, PackPlatform)> {
+async fn inspect_pack_archive(path: &Path) -> Result<(Value, PackPlatform)> {
     // A PrismLauncher JSON modlist export is a plain JSON array, not a ZIP.
     if let Some(mods) = read_prism_modlist(path).await {
-        return Ok((json!({ "homeshardModlist": mods }), PackPlatform::PrismModlist));
+        return Ok((
+            json!({ "homeshardModlist": mods }),
+            PackPlatform::PrismModlist,
+        ));
     }
 
     let archive = path.display().to_string();
@@ -2186,6 +2477,491 @@ fn pack_platform(manifest: &Value) -> Result<PackPlatform> {
         return Ok(PackPlatform::Modrinth);
     }
     Err(anyhow!("unsupported stored pack manifest"))
+}
+
+async fn backup_instance(
+    pool: &PgPool,
+    settings: &Settings,
+    instance_id: Option<Uuid>,
+    payload: Value,
+) -> Result<CommandResult> {
+    let instance_id = instance_id.ok_or_else(|| anyhow!("instance_id is required"))?;
+    let payload: BackupInstancePayload =
+        serde_json::from_value(payload).context("invalid backup_instance payload")?;
+    let kind = payload.backup_kind.as_deref().unwrap_or("manual");
+    if !matches!(kind, "manual" | "scheduled") {
+        return Err(anyhow!("unsupported backup kind: {kind}"));
+    }
+    let backup = create_world_backup(pool, settings, instance_id, kind, true).await?;
+    Ok(CommandResult {
+        ok: true,
+        message: format!("Created {kind} world backup"),
+        data: json!({
+            "backupId": backup.id,
+            "sizeBytes": backup.size_bytes,
+            "worldSeed": backup.world_seed,
+        }),
+    })
+}
+
+async fn regenerate_world(
+    pool: &PgPool,
+    settings: &Settings,
+    instance_id: Option<Uuid>,
+    payload: Value,
+) -> Result<CommandResult> {
+    let instance_id = instance_id.ok_or_else(|| anyhow!("instance_id is required"))?;
+    let payload: RegenerateWorldPayload =
+        serde_json::from_value(payload).context("invalid regenerate_world payload")?;
+    let seed = validate_world_seed(payload.seed)?;
+    require_world_mutation_state(pool, instance_id).await?;
+    let backup = create_world_backup(pool, settings, instance_id, "pre_regenerate", false).await?;
+
+    merge_instance_state(
+        pool,
+        instance_id,
+        "deploying",
+        json!({ "reason": Value::Null, "stage": "world_regenerate" }),
+    )
+    .await?;
+    let result = async {
+        remove_sleep_proxy(instance_id).await?;
+        let container = format!("homeshard-{instance_id}");
+        remove_managed_container_if_present(&container, instance_id).await?;
+        remove_world_directories(settings, instance_id).await?;
+        sqlx::query("UPDATE instances SET world_seed = $2, updated_at = now() WHERE id = $1")
+            .bind(instance_id)
+            .bind(seed.as_deref())
+            .execute(pool)
+            .await?;
+        launch_existing_instance(pool, settings, instance_id, seed.as_deref()).await
+    }
+    .await;
+    if let Err(error) = result {
+        update_instance_state(
+            pool,
+            instance_id,
+            "failed",
+            json!({ "reason": format!("{error:#}"), "stage": "world_regenerate", "backupId": backup.id }),
+        )
+        .await?;
+        return Err(error);
+    }
+
+    Ok(CommandResult {
+        ok: true,
+        message: "Backed up the previous world and generated a new one".into(),
+        data: json!({ "backupId": backup.id, "worldSeed": seed, "state": "running" }),
+    })
+}
+
+async fn restore_backup(
+    pool: &PgPool,
+    settings: &Settings,
+    instance_id: Option<Uuid>,
+    payload: Value,
+) -> Result<CommandResult> {
+    let instance_id = instance_id.ok_or_else(|| anyhow!("instance_id is required"))?;
+    let payload: RestoreBackupPayload =
+        serde_json::from_value(payload).context("invalid restore_backup payload")?;
+    require_world_mutation_state(pool, instance_id).await?;
+    let row = sqlx::query(
+        "SELECT cold_path, world_seed FROM instance_backups WHERE id = $1 AND instance_id = $2",
+    )
+    .bind(payload.backup_id)
+    .bind(instance_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| anyhow!("backup does not exist for this instance"))?;
+    let archive = PathBuf::from(row.get::<String, _>("cold_path"));
+    let world_seed: Option<String> = row.get("world_seed");
+    let backup_root = tokio::fs::canonicalize(settings.cold_root.join("backups")).await?;
+    let canonical_archive = tokio::fs::canonicalize(&archive).await?;
+    if !canonical_archive.starts_with(&backup_root) {
+        return Err(anyhow!("backup path escapes cold storage"));
+    }
+
+    let current_backup =
+        create_world_backup(pool, settings, instance_id, "pre_restore", false).await?;
+    let data_dir = settings.active_root.join(instance_id.to_string());
+    let expected_worlds = world_directory_names(&data_dir).await?;
+    let archived_worlds = validate_backup_archive(&canonical_archive, &expected_worlds).await?;
+    let staging = data_dir.join(format!(".restore-{}", Uuid::new_v4()));
+    tokio::fs::create_dir_all(&staging).await?;
+    let extract_result = run_owned_command(
+        "tar",
+        &[
+            "-xzf".into(),
+            canonical_archive.display().to_string(),
+            "-C".into(),
+            staging.display().to_string(),
+            "--".into(),
+        ],
+    )
+    .await;
+    if let Err(error) = extract_result {
+        let _ = tokio::fs::remove_dir_all(&staging).await;
+        return Err(error.context("extract world backup"));
+    }
+
+    merge_instance_state(
+        pool,
+        instance_id,
+        "deploying",
+        json!({ "reason": Value::Null, "stage": "world_restore" }),
+    )
+    .await?;
+    let result = async {
+        remove_sleep_proxy(instance_id).await?;
+        let container = format!("homeshard-{instance_id}");
+        remove_managed_container_if_present(&container, instance_id).await?;
+        remove_world_directories(settings, instance_id).await?;
+        for world in &archived_worlds {
+            tokio::fs::rename(staging.join(world), data_dir.join(world)).await?;
+        }
+        tokio::fs::remove_dir_all(&staging).await?;
+        sqlx::query("UPDATE instances SET world_seed = $2, updated_at = now() WHERE id = $1")
+            .bind(instance_id)
+            .bind(world_seed.as_deref())
+            .execute(pool)
+            .await?;
+        launch_existing_instance(pool, settings, instance_id, world_seed.as_deref()).await
+    }
+    .await;
+    if let Err(error) = result {
+        let _ = tokio::fs::remove_dir_all(&staging).await;
+        update_instance_state(
+            pool,
+            instance_id,
+            "failed",
+            json!({ "reason": format!("{error:#}"), "stage": "world_restore", "backupId": current_backup.id }),
+        )
+        .await?;
+        return Err(error);
+    }
+
+    Ok(CommandResult {
+        ok: true,
+        message: "Restored the selected world backup and started the server".into(),
+        data: json!({ "backupId": payload.backup_id, "safetyBackupId": current_backup.id, "state": "running" }),
+    })
+}
+
+async fn create_world_backup(
+    pool: &PgPool,
+    settings: &Settings,
+    instance_id: Uuid,
+    kind: &str,
+    require_safe_state: bool,
+) -> Result<CreatedBackup> {
+    let row = sqlx::query("SELECT state::text AS state, world_seed FROM instances WHERE id = $1")
+        .bind(instance_id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| anyhow!("instance does not exist"))?;
+    let state: String = row.get("state");
+    if require_safe_state && !is_world_mutation_state(&state) {
+        return Err(anyhow!(
+            "world backups require a sleeping, stopped, or failed instance"
+        ));
+    }
+    let world_seed: Option<String> = row.get("world_seed");
+    let data_dir = settings.active_root.join(instance_id.to_string());
+    let world_names = world_directory_names(&data_dir).await?;
+    let mut existing = Vec::new();
+    for name in world_names {
+        if tokio::fs::metadata(data_dir.join(&name)).await.is_ok() {
+            existing.push(name);
+        }
+    }
+    if existing.is_empty() {
+        return Err(anyhow!("no world directory exists to back up"));
+    }
+
+    let backup_id = Uuid::new_v4();
+    let backup_dir = settings
+        .cold_root
+        .join("backups")
+        .join(instance_id.to_string());
+    tokio::fs::create_dir_all(&backup_dir).await?;
+    let final_path = backup_dir.join(format!("{backup_id}.tar.gz"));
+    let temporary = backup_dir.join(format!(".{backup_id}.tar.gz.part"));
+    let mut args = vec![
+        "-C".into(),
+        data_dir.display().to_string(),
+        "-czf".into(),
+        temporary.display().to_string(),
+        "--".into(),
+    ];
+    args.extend(existing);
+    if let Err(error) = run_owned_command("tar", &args).await {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(error.context("create compressed world backup"));
+    }
+    tokio::fs::rename(&temporary, &final_path).await?;
+    let size_bytes = tokio::fs::metadata(&final_path).await?.len();
+    let insert = sqlx::query(
+        r#"
+        INSERT INTO instance_backups (id, instance_id, kind, cold_path, size_bytes, world_seed)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        "#,
+    )
+    .bind(backup_id)
+    .bind(instance_id)
+    .bind(kind)
+    .bind(final_path.display().to_string())
+    .bind(size_bytes as i64)
+    .bind(world_seed.as_deref())
+    .execute(pool)
+    .await;
+    if let Err(error) = insert {
+        let _ = tokio::fs::remove_file(&final_path).await;
+        return Err(error.into());
+    }
+    info!(%instance_id, %backup_id, kind, size_bytes, "world backup created");
+    if kind == "scheduled" {
+        if let Err(error) = prune_scheduled_backups(
+            pool,
+            settings,
+            instance_id,
+            settings.scheduled_backup_retention,
+        )
+        .await
+        {
+            warn!(%instance_id, error = %error, "could not prune old scheduled backups");
+        }
+    }
+    Ok(CreatedBackup {
+        id: backup_id,
+        size_bytes,
+        world_seed,
+    })
+}
+
+async fn prune_scheduled_backups(
+    pool: &PgPool,
+    settings: &Settings,
+    instance_id: Uuid,
+    retain: usize,
+) -> Result<()> {
+    let rows = sqlx::query(
+        r#"
+        SELECT id, cold_path
+        FROM instance_backups
+        WHERE instance_id = $1 AND kind = 'scheduled'
+        ORDER BY created_at DESC
+        OFFSET $2
+        "#,
+    )
+    .bind(instance_id)
+    .bind(retain as i64)
+    .fetch_all(pool)
+    .await?;
+    let instance_backup_root = settings
+        .cold_root
+        .join("backups")
+        .join(instance_id.to_string());
+    for row in rows {
+        let backup_id: Uuid = row.get("id");
+        let path = PathBuf::from(row.get::<String, _>("cold_path"));
+        if !path.starts_with(&instance_backup_root) {
+            return Err(anyhow!("refusing to prune backup outside instance storage"));
+        }
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        sqlx::query("DELETE FROM instance_backups WHERE id = $1")
+            .bind(backup_id)
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn require_world_mutation_state(pool: &PgPool, instance_id: Uuid) -> Result<()> {
+    let state: String = sqlx::query_scalar("SELECT state::text FROM instances WHERE id = $1")
+        .bind(instance_id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| anyhow!("instance does not exist"))?;
+    if !is_world_mutation_state(&state) {
+        return Err(anyhow!(
+            "sleep or stop the server before changing its world"
+        ));
+    }
+    Ok(())
+}
+
+fn is_world_mutation_state(state: &str) -> bool {
+    matches!(state, "sleeping" | "stopped" | "failed")
+}
+
+fn validate_world_seed(seed: Option<String>) -> Result<Option<String>> {
+    let seed = seed
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if let Some(value) = &seed {
+        if value.len() > 128 || value.chars().any(char::is_control) {
+            return Err(anyhow!(
+                "world seed must be at most 128 printable characters"
+            ));
+        }
+    }
+    Ok(seed)
+}
+
+async fn world_directory_names(data_dir: &Path) -> Result<Vec<String>> {
+    let properties = tokio::fs::read_to_string(data_dir.join("server.properties"))
+        .await
+        .unwrap_or_default();
+    world_names_from_properties(&properties)
+}
+
+fn world_names_from_properties(properties: &str) -> Result<Vec<String>> {
+    let level_name = properties
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .find_map(|line| line.split_once('=').filter(|(key, _)| *key == "level-name"))
+        .map(|(_, value)| value.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("world");
+    if !is_safe_world_name(level_name) {
+        return Err(anyhow!("server.properties contains an unsafe level-name"));
+    }
+    Ok(vec![
+        level_name.to_string(),
+        format!("{level_name}_nether"),
+        format!("{level_name}_the_end"),
+    ])
+}
+
+fn is_safe_world_name(value: &str) -> bool {
+    let mut components = Path::new(value).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
+async fn remove_world_directories(settings: &Settings, instance_id: Uuid) -> Result<()> {
+    let data_dir = settings.active_root.join(instance_id.to_string());
+    for name in world_directory_names(&data_dir).await? {
+        match tokio::fs::remove_dir_all(data_dir.join(name)).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+async fn validate_backup_archive(
+    archive: &Path,
+    expected_worlds: &[String],
+) -> Result<Vec<String>> {
+    let listing = run_owned_command("tar", &["-tzf".into(), archive.display().to_string()]).await?;
+    let verbose =
+        run_owned_command("tar", &["-tvzf".into(), archive.display().to_string()]).await?;
+    if verbose
+        .lines()
+        .any(|line| !matches!(line.as_bytes().first().copied(), Some(b'-' | b'd')))
+    {
+        return Err(anyhow!(
+            "backup contains links or unsupported archive entries"
+        ));
+    }
+    validate_backup_listing(&listing, expected_worlds)
+}
+
+fn validate_backup_listing(listing: &str, expected_worlds: &[String]) -> Result<Vec<String>> {
+    let expected = expected_worlds
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut roots = BTreeSet::new();
+    for entry in listing
+        .lines()
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let path = Path::new(entry.trim_end_matches('/'));
+        let mut components = path.components();
+        let Some(Component::Normal(root)) = components.next() else {
+            return Err(anyhow!("backup contains an unsafe archive path"));
+        };
+        if components.any(|component| !matches!(component, Component::Normal(_))) {
+            return Err(anyhow!("backup contains an unsafe archive path"));
+        }
+        let root = root.to_string_lossy().to_string();
+        if !expected.contains(root.as_str()) {
+            return Err(anyhow!("backup contains an unexpected world directory"));
+        }
+        roots.insert(root);
+    }
+    if roots.is_empty() {
+        return Err(anyhow!("backup archive is empty"));
+    }
+    Ok(roots.into_iter().collect())
+}
+
+async fn launch_existing_instance(
+    pool: &PgPool,
+    settings: &Settings,
+    instance_id: Uuid,
+    world_seed: Option<&str>,
+) -> Result<()> {
+    let row = sqlx::query(
+        "SELECT name, port, server_type, game_version, memory_mb FROM instances WHERE id = $1",
+    )
+    .bind(instance_id)
+    .fetch_one(pool)
+    .await?;
+    let name: String = row.get("name");
+    let port: i32 = row.get("port");
+    let server_type: String = row.get("server_type");
+    let game_version: String = row.get("game_version");
+    let memory_mb: i32 = row.get("memory_mb");
+    let pack = load_active_pack(pool, instance_id).await?;
+    launch_instance(
+        settings,
+        instance_id,
+        &name,
+        port,
+        &server_type,
+        &game_version,
+        world_seed,
+        memory_mb,
+        pack.as_ref(),
+    )
+    .await?;
+    update_instance_state(
+        pool,
+        instance_id,
+        "running",
+        json!({ "players": 0, "maxPlayers": 20 }),
+    )
+    .await
+}
+
+async fn load_active_pack(pool: &PgPool, instance_id: Uuid) -> Result<Option<PackArchive>> {
+    sqlx::query(
+        "SELECT original_name, sha256, cold_path, manifest, size_bytes FROM pack_revisions WHERE instance_id = $1 AND active = true ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(instance_id)
+    .fetch_optional(pool)
+    .await?
+    .map(|row| {
+        let manifest: Value = row.get("manifest");
+        Ok(PackArchive {
+            path: PathBuf::from(row.get::<String, _>("cold_path")),
+            original_name: row.get("original_name"),
+            sha256: row.get("sha256"),
+            size_bytes: row.get("size_bytes"),
+            platform: pack_platform(&manifest)?,
+            manifest,
+        })
+    })
+    .transpose()
 }
 
 async fn trash_instance(
@@ -2349,22 +3125,44 @@ async fn docker_lifecycle(
     if !start_proxy {
         remove_sleep_proxy(instance_id).await?;
     }
-    docker([docker_action, &container]).await?;
+    if state == "running" {
+        merge_instance_state(
+            pool,
+            instance_id,
+            "deploying",
+            json!({ "reason": Value::Null, "players": 0, "statusUpdatedAt": Value::Null }),
+        )
+        .await?;
+        docker(["update", "--restart", "on-failure:3", &container]).await?;
+        docker([docker_action, &container]).await?;
+        if let Err(error) = await_instance_ready(settings, &container, false).await {
+            update_instance_state(
+                pool,
+                instance_id,
+                "failed",
+                json!({ "reason": format!("{error:#}"), "stage": "container_start" }),
+            )
+            .await?;
+            return Err(error);
+        }
+    } else {
+        docker([docker_action, &container]).await?;
+    }
     if start_proxy {
         if let Err(error) = start_sleep_proxy(settings, instance_id, port, max_players).await {
             let _ = docker(["start", &container]).await;
             return Err(error.context("start sleeping proxy"));
         }
     }
-    let status_patch = if state == "running" {
-        json!({})
-    } else {
-        json!({ "players": 0, "statusUpdatedAt": Value::Null })
-    };
+    let status_patch = json!({
+        "reason": Value::Null,
+        "players": 0,
+        "statusUpdatedAt": Value::Null,
+    });
     merge_instance_state(pool, instance_id, state, status_patch).await?;
     Ok(CommandResult {
         ok: true,
-        message: format!("{action} queued for {instance_id}"),
+        message: format!("{action} completed for {instance_id}"),
         data: json!({ "instanceId": instance_id, "state": state }),
     })
 }
@@ -2452,6 +3250,11 @@ async fn run_command(program: &str, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+async fn run_owned_command(program: &str, args: &[String]) -> Result<String> {
+    let borrowed = args.iter().map(String::as_str).collect::<Vec<_>>();
+    run_command(program, &borrowed).await
+}
+
 async fn allocate_port(pool: &PgPool, port_start: i32, port_end: i32) -> Result<i32> {
     let row = sqlx::query(
         r#"
@@ -2518,11 +3321,14 @@ async fn sha256_file(path: &PathBuf) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        blocked_mods_from_cf_logs, cf_name_from_url, curseforge_project_id,
-        curseforge_server_ready, idle_action, lifecycle_plan, modrinth_slug, parse_meminfo,
+        backup_schedule_date, blocked_mods_from_cf_logs, cf_name_from_url, curseforge_project_id,
+        idle_action, lifecycle_plan, modrinth_slug, parse_container_runtime_state, parse_meminfo,
         parse_player_count, pick_minecraft_image, proxy_packet_length, proxy_read_varint,
-        proxy_write_varint, slugify, IdleAction,
+        proxy_write_varint, slugify, validate_backup_listing, validate_world_seed,
+        world_names_from_properties, ContainerRuntimeState, IdleAction,
     };
+    use chrono::{TimeZone, Utc};
+    use chrono_tz::Europe::Budapest;
     use std::io::Cursor;
 
     #[test]
@@ -2531,7 +3337,10 @@ mod tests {
             curseforge_project_id("https://www.curseforge.com/projects/1191517"),
             Some(1191517)
         );
-        assert_eq!(curseforge_project_id("https://modrinth.com/mod/tagwiZkJ"), None);
+        assert_eq!(
+            curseforge_project_id("https://modrinth.com/mod/tagwiZkJ"),
+            None
+        );
         assert_eq!(
             curseforge_project_id("https://www.curseforge.com/minecraft/mc-mods/jei"),
             None
@@ -2548,18 +3357,36 @@ mod tests {
             modrinth_slug("https://modrinth.com/mod/sodium?foo=1"),
             Some("sodium".to_string())
         );
-        assert_eq!(modrinth_slug("https://www.curseforge.com/projects/123"), None);
+        assert_eq!(
+            modrinth_slug("https://www.curseforge.com/projects/123"),
+            None
+        );
     }
 
     #[test]
     fn selects_java_image_by_minecraft_version() {
         let default_image = "itzg/minecraft-server:java21";
         let modern_image = "itzg/minecraft-server:java25";
-        assert_eq!(pick_minecraft_image(default_image, modern_image, Some("1.21.1")), default_image);
-        assert_eq!(pick_minecraft_image(default_image, modern_image, Some("1.20.4")), default_image);
-        assert_eq!(pick_minecraft_image(default_image, modern_image, Some("26.1.2")), modern_image);
-        assert_eq!(pick_minecraft_image(default_image, modern_image, Some(" ")), default_image);
-        assert_eq!(pick_minecraft_image(default_image, modern_image, None), default_image);
+        assert_eq!(
+            pick_minecraft_image(default_image, modern_image, Some("1.21.1")),
+            default_image
+        );
+        assert_eq!(
+            pick_minecraft_image(default_image, modern_image, Some("1.20.4")),
+            default_image
+        );
+        assert_eq!(
+            pick_minecraft_image(default_image, modern_image, Some("26.1.2")),
+            modern_image
+        );
+        assert_eq!(
+            pick_minecraft_image(default_image, modern_image, Some(" ")),
+            default_image
+        );
+        assert_eq!(
+            pick_minecraft_image(default_image, modern_image, None),
+            default_image
+        );
     }
 
     #[test]
@@ -2641,14 +3468,8 @@ mod tests {
 
     #[test]
     fn stop_and_sleep_have_distinct_lifecycle_plans() {
-        assert_eq!(
-            lifecycle_plan("stop").unwrap(),
-            ("stop", "stopped", false)
-        );
-        assert_eq!(
-            lifecycle_plan("sleep").unwrap(),
-            ("stop", "sleeping", true)
-        );
+        assert_eq!(lifecycle_plan("stop").unwrap(), ("stop", "stopped", false));
+        assert_eq!(lifecycle_plan("sleep").unwrap(), ("stop", "sleeping", true));
         assert!(lifecycle_plan("invalid").is_err());
     }
 
@@ -2690,9 +3511,68 @@ mod tests {
     }
 
     #[test]
-    fn curseforge_server_ready_detects_startup() {
-        assert!(curseforge_server_ready("Done (12.3s)! For help, type \"help\""));
-        assert!(curseforge_server_ready("[15:00:00] [Server thread]: RCON running on 0.0.0.0:25575"));
-        assert!(!curseforge_server_ready("Downloading mods (12/175)"));
+    fn parses_docker_runtime_state() {
+        assert_eq!(
+            parse_container_runtime_state("exited 2 3").unwrap(),
+            ContainerRuntimeState {
+                status: "exited".into(),
+                exit_code: 2,
+                restart_count: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn world_directory_names_use_level_name_and_reject_traversal() {
+        assert_eq!(
+            world_names_from_properties("motd=Hello\nlevel-name=survival\n").unwrap(),
+            vec!["survival", "survival_nether", "survival_the_end"]
+        );
+        assert!(world_names_from_properties("level-name=../outside\n").is_err());
+        assert!(world_names_from_properties("level-name=/absolute\n").is_err());
+    }
+
+    #[test]
+    fn validates_world_seed_input() {
+        assert_eq!(
+            validate_world_seed(Some("  12345  ".into())).unwrap(),
+            Some("12345".into())
+        );
+        assert_eq!(validate_world_seed(Some("   ".into())).unwrap(), None);
+        assert!(validate_world_seed(Some("bad\nseed".into())).is_err());
+        assert!(validate_world_seed(Some("x".repeat(129))).is_err());
+    }
+
+    #[test]
+    fn backup_listing_is_limited_to_expected_world_directories() {
+        let expected = vec![
+            "world".into(),
+            "world_nether".into(),
+            "world_the_end".into(),
+        ];
+        assert_eq!(
+            validate_backup_listing(
+                "world/\nworld/level.dat\nworld_nether/DIM-1/region/r.0.0.mca\n",
+                &expected
+            )
+            .unwrap(),
+            vec!["world", "world_nether"]
+        );
+        assert!(validate_backup_listing("../escape\n", &expected).is_err());
+        assert!(validate_backup_listing("other/file\n", &expected).is_err());
+    }
+
+    #[test]
+    fn daily_backup_becomes_due_at_six_in_budapest() {
+        let before = Utc
+            .with_ymd_and_hms(2026, 7, 8, 3, 59, 0)
+            .unwrap()
+            .with_timezone(&Budapest);
+        let at_six = Utc
+            .with_ymd_and_hms(2026, 7, 8, 4, 0, 0)
+            .unwrap()
+            .with_timezone(&Budapest);
+        assert_eq!(backup_schedule_date(before, 6), None);
+        assert_eq!(backup_schedule_date(at_six, 6), Some("2026-07-08".into()));
     }
 }

@@ -8,7 +8,9 @@ import { getInstanceDetail } from "@/lib/instances";
 import { blockedModsSummary, parseBlockedMods, tidyErrorMessage } from "@/lib/blocked-mods";
 import { InstanceActions } from "@/components/instance-actions";
 import { CommandActivity } from "./command-activity";
+import { BackupManager } from "./backup-manager";
 import { ConsolePanel } from "./console-panel";
+import { InstanceNameEditor } from "./instance-name-editor";
 import { ModManager } from "./mod-manager";
 
 export const dynamic = "force-dynamic";
@@ -90,7 +92,10 @@ export default async function InstancePage({ params }: { params: Promise<{ id: s
           <div className="mb-6 flex flex-col justify-between gap-4 border-b border-[var(--border-muted)] pb-5 md:flex-row md:items-start">
             <div>
               <div className="mb-2 flex flex-wrap items-center gap-2">
-                <h1 className="text-xl font-semibold">{instance.name}</h1>
+                <div className="flex items-center gap-1">
+                  <h1 className="text-xl font-semibold">{instance.name}</h1>
+                  <InstanceNameEditor instanceId={id} name={instance.name} />
+                </div>
                 <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium ${badgeCls}`}>
                   <span className="size-1.5 rounded-full bg-current" />
                   {instance.state}
@@ -161,7 +166,12 @@ export default async function InstancePage({ params }: { params: Promise<{ id: s
             </TabsContent>
 
             <TabsContent value="backups">
-              <Placeholder title="Backups" description="Restic snapshots, pinned backups, restore, and trash retention land here." />
+              <BackupManager
+                instanceId={id}
+                state={instance.state}
+                worldSeed={instance.worldSeed}
+                backups={instance.backups}
+              />
             </TabsContent>
           </Tabs>
         </main>

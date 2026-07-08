@@ -2,7 +2,7 @@
 
 import { type DragEvent, type FormEvent, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Download, Link, Loader2, Plus, RefreshCw, Save, Upload } from "lucide-react";
+import { ArrowDown, ArrowUp, ArrowUpDown, Download, Link, Loader2, Plus, RefreshCw, Save, Search, Trash2, Upload } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
@@ -16,6 +16,9 @@ type CommandStatus = {
   result?: { message?: string } | null;
 };
 
+type SortKey = "enabled" | "name" | "size";
+type SortDirection = "asc" | "desc";
+
 const wait = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
 
 export function ModManager({ instanceId, mods, state }: { instanceId: string; mods: InstanceMod[]; state: InstanceState }) {
@@ -25,19 +28,55 @@ export function ModManager({ instanceId, mods, state }: { instanceId: string; mo
     [mods],
   );
   const [disabled, setDisabled] = useState(initialDisabled);
-  const [pending, setPending] = useState<"sync_mods" | "set_instance_mods" | "add_instance_mod" | null>(null);
+  const [pending, setPending] = useState<"sync_mods" | "set_instance_mods" | "add_instance_mod" | "delete_instance_mod" | null>(null);
+  const [deletingFilename, setDeletingFilename] = useState<string | null>(null);
   const [addOpen, setAddOpen] = useState(false);
   const [modUrl, setModUrl] = useState("");
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [dragging, setDragging] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  const [sort, setSort] = useState<{ key: SortKey; direction: SortDirection }>({ key: "name", direction: "asc" });
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const disabledList = Array.from(disabled).sort();
   const initialDisabledList = Array.from(initialDisabled).sort();
   const changed = disabledList.join("\n") !== initialDisabledList.join("\n");
   const activeCount = mods.length - disabled.size;
+  const sortedMods = useMemo(() => {
+    const direction = sort.direction === "asc" ? 1 : -1;
+    return [...mods].sort((left, right) => {
+      let comparison = 0;
+      if (sort.key === "name") {
+        comparison = left.filename.localeCompare(right.filename, undefined, { numeric: true, sensitivity: "base" });
+      } else if (sort.key === "size") {
+        comparison = left.sizeBytes - right.sizeBytes;
+      } else {
+        comparison = Number(!disabled.has(left.filename)) - Number(!disabled.has(right.filename));
+      }
+      return comparison === 0
+        ? left.filename.localeCompare(right.filename, undefined, { numeric: true, sensitivity: "base" })
+        : comparison * direction;
+    });
+  }, [disabled, mods, sort]);
+  const visibleMods = useMemo(() => {
+    const normalized = query.trim().toLocaleLowerCase();
+    return normalized
+      ? sortedMods.filter((mod) => mod.filename.toLocaleLowerCase().includes(normalized))
+      : sortedMods;
+  }, [query, sortedMods]);
+
+  function changeSort(key: SortKey) {
+    setSort((current) => current.key === key
+      ? { key, direction: current.direction === "asc" ? "desc" : "asc" }
+      : { key, direction: key === "enabled" || key === "size" ? "desc" : "asc" });
+  }
+
+  function sortIcon(key: SortKey) {
+    if (sort.key !== key) return <ArrowUpDown className="size-3" />;
+    return sort.direction === "asc" ? <ArrowUp className="size-3" /> : <ArrowDown className="size-3" />;
+  }
 
   async function queue(kind: "sync_mods" | "set_instance_mods") {
     setPending(kind);
@@ -90,8 +129,32 @@ export function ModManager({ instanceId, mods, state }: { instanceId: string; mo
     }
   }
 
-  async function waitForCommand(id: string, kind: "sync_mods" | "set_instance_mods" | "add_instance_mod") {
-    for (let attempt = 0; attempt < 80; attempt += 1) {
+  async function deleteMod(filename: string) {
+    if (!window.confirm(`Permanently delete ${filename} from this instance?`)) return;
+    setPending("delete_instance_mod");
+    setDeletingFilename(filename);
+    setMessage(null);
+    setError(null);
+    try {
+      const response = await fetch("/api/commands", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ instanceId, kind: "delete_instance_mod", payload: { filename } }),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.error ?? "Could not queue mod deletion");
+      if (body.id) await waitForCommand(body.id, "delete_instance_mod");
+      router.refresh();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not delete mod");
+    } finally {
+      setPending(null);
+      setDeletingFilename(null);
+    }
+  }
+
+  async function waitForCommand(id: string, kind: "sync_mods" | "set_instance_mods" | "add_instance_mod" | "delete_instance_mod") {
+    for (let attempt = 0; attempt < 800; attempt += 1) {
       const response = await fetch(`/api/commands?id=${encodeURIComponent(id)}`, { cache: "no-store" });
       const command = (await response.json()) as CommandStatus;
       if (!response.ok) throw new Error(command.error ?? "Could not read command status");
@@ -103,6 +166,8 @@ export function ModManager({ instanceId, mods, state }: { instanceId: string; mo
             ? "Scanning mods on the homeserver..."
             : kind === "add_instance_mod"
               ? "Installing the new jar and restarting the instance if needed..."
+              : kind === "delete_instance_mod"
+                ? "Deleting the jar and restarting the instance if needed..."
               : "Moving jars and restarting the instance...",
         );
       } else if (command.status === "succeeded") {
@@ -158,6 +223,39 @@ export function ModManager({ instanceId, mods, state }: { instanceId: string; mo
       </div>
 
       <div className="space-y-4 px-4 py-4">
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+          {mods.length > 0 && (
+            <div className="relative w-full max-w-md">
+              <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-[var(--muted-foreground)]" />
+              <Input
+                type="search"
+                value={query}
+                onChange={(event) => setQuery(event.currentTarget.value)}
+                placeholder="Search mods by filename"
+                aria-label="Search mods"
+                className="pl-8"
+              />
+            </div>
+          )}
+          <div className="flex flex-wrap gap-2">
+            <Button variant="outline" size="sm" disabled={Boolean(pending) || state === "trashed"} onClick={() => setAddOpen(true)}>
+              <Plus className="size-4" />Add new mod
+            </Button>
+            {mods.length ? (
+              <Button asChild variant="outline" size="sm" title="Download every installed jar as a zip to import elsewhere">
+                <a href={`/api/instances/${instanceId}/mods/download`}><Download className="size-4" />Download all (.zip)</a>
+              </Button>
+            ) : (
+              <Button variant="outline" size="sm" disabled><Download className="size-4" />Download all (.zip)</Button>
+            )}
+            <Button variant="outline" size="sm" disabled={Boolean(pending)} onClick={() => queue("sync_mods")}>
+              {pending === "sync_mods" ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}Refresh mods
+            </Button>
+            <Button size="sm" disabled={Boolean(pending) || !mods.length || !changed || state === "trashed"} onClick={() => queue("set_instance_mods")}>
+              {pending === "set_instance_mods" ? <Loader2 className="size-4 animate-spin" /> : <Save className="size-4" />}Save and restart
+            </Button>
+          </div>
+        </div>
         {!mods.length ? (
           <p className="text-sm text-[var(--muted-foreground)]">No mod inventory has been synced yet. Refresh to scan the instance folders.</p>
         ) : (
@@ -165,13 +263,26 @@ export function ModManager({ instanceId, mods, state }: { instanceId: string; mo
             <Table>
               <TableHeader>
                 <TableRow className="border-[var(--border-muted)] bg-[var(--canvas-inset)]">
-                  <TableHead className="w-24 text-xs text-[var(--muted-foreground)]">Run</TableHead>
-                  <TableHead className="text-xs text-[var(--muted-foreground)]">Jar</TableHead>
-                  <TableHead className="w-28 text-right text-xs text-[var(--muted-foreground)]">Size</TableHead>
+                  <TableHead className="w-28 text-xs text-[var(--muted-foreground)]" aria-sort={sort.key === "enabled" ? (sort.direction === "asc" ? "ascending" : "descending") : "none"}>
+                    <button type="button" onClick={() => changeSort("enabled")} className="inline-flex items-center gap-1 hover:text-foreground">
+                      Enabled {sortIcon("enabled")}
+                    </button>
+                  </TableHead>
+                  <TableHead className="text-xs text-[var(--muted-foreground)]" aria-sort={sort.key === "name" ? (sort.direction === "asc" ? "ascending" : "descending") : "none"}>
+                    <button type="button" onClick={() => changeSort("name")} className="inline-flex items-center gap-1 hover:text-foreground">
+                      Name {sortIcon("name")}
+                    </button>
+                  </TableHead>
+                  <TableHead className="w-28 text-right text-xs text-[var(--muted-foreground)]" aria-sort={sort.key === "size" ? (sort.direction === "asc" ? "ascending" : "descending") : "none"}>
+                    <button type="button" onClick={() => changeSort("size")} className="ml-auto inline-flex items-center gap-1 hover:text-foreground">
+                      Size {sortIcon("size")}
+                    </button>
+                  </TableHead>
+                  <TableHead className="w-12"><span className="sr-only">Actions</span></TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {mods.map((mod) => {
+                {visibleMods.map((mod) => {
                   const enabled = !disabled.has(mod.filename);
                   return (
                     <TableRow key={mod.filename} className="border-[var(--border-muted)]">
@@ -187,31 +298,34 @@ export function ModManager({ instanceId, mods, state }: { instanceId: string; mo
                       </TableCell>
                       <TableCell className="whitespace-normal break-all font-mono text-xs">{mod.filename}</TableCell>
                       <TableCell className="text-right text-xs text-[var(--muted-foreground)]">{formatBytes(mod.sizeBytes)}</TableCell>
+                      <TableCell className="text-right">
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon-xs"
+                          className="text-[var(--danger)] hover:bg-[var(--danger-muted)] hover:text-[var(--danger)]"
+                          disabled={Boolean(pending) || state === "trashed"}
+                          onClick={() => void deleteMod(mod.filename)}
+                          aria-label={`Delete ${mod.filename}`}
+                          title={`Delete ${mod.filename}`}
+                        >
+                          {deletingFilename === mod.filename ? <Loader2 className="size-3 animate-spin" /> : <Trash2 className="size-3" />}
+                        </Button>
+                      </TableCell>
                     </TableRow>
                   );
                 })}
+                {visibleMods.length === 0 && (
+                  <TableRow>
+                    <TableCell colSpan={4} className="py-8 text-center text-sm text-[var(--muted-foreground)]">
+                      No mods match “{query.trim()}”.
+                    </TableCell>
+                  </TableRow>
+                )}
               </TableBody>
             </Table>
           </div>
         )}
-        <div className="flex flex-wrap gap-2">
-          <Button variant="outline" size="sm" disabled={Boolean(pending) || state === "trashed"} onClick={() => setAddOpen(true)}>
-            <Plus className="size-4" />Add new mod
-          </Button>
-          {mods.length ? (
-            <Button asChild variant="outline" size="sm" title="Download every installed jar as a zip to import elsewhere">
-              <a href={`/api/instances/${instanceId}/mods/download`}><Download className="size-4" />Download all (.zip)</a>
-            </Button>
-          ) : (
-            <Button variant="outline" size="sm" disabled><Download className="size-4" />Download all (.zip)</Button>
-          )}
-          <Button variant="outline" size="sm" disabled={Boolean(pending)} onClick={() => queue("sync_mods")}>
-            {pending === "sync_mods" ? <Loader2 className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}Refresh mods
-          </Button>
-          <Button size="sm" disabled={Boolean(pending) || !mods.length || !changed || state === "trashed"} onClick={() => queue("set_instance_mods")}>
-            {pending === "set_instance_mods" ? <Loader2 className="size-4 animate-spin" /> : <Save className="size-4" />}Save and restart
-          </Button>
-        </div>
         {message && <p className="text-sm text-[var(--muted-foreground)]">{message}</p>}
         {error   && <p className="text-sm text-[var(--danger)]">{error}</p>}
       </div>
