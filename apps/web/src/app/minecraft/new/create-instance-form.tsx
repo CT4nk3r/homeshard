@@ -36,6 +36,7 @@ export function CreateInstanceForm() {
   const [analyzingPack, setAnalyzingPack] = useState(false);
   const [packMessage, setPackMessage] = useState<string | null>(null);
   const inspectionSequence = useRef(0);
+  const submittingRef = useRef(false);
 
   useEffect(() => {
     fetch("/api/packs/capabilities")
@@ -144,6 +145,8 @@ export function CreateInstanceForm() {
   }
 
   async function submit(formData: FormData) {
+    if (submittingRef.current) return;
+    submittingRef.current = true;
     setBusy(true);
     setMessage(null);
     try {
@@ -177,6 +180,7 @@ export function CreateInstanceForm() {
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Could not queue instance");
     } finally {
+      submittingRef.current = false;
       setBusy(false);
     }
   }
@@ -203,7 +207,8 @@ export function CreateInstanceForm() {
 
   return (
     <div className="space-y-6">
-    <form action={submit} className="space-y-5">
+    <form action={submit} className="space-y-5" aria-busy={busy || analyzingPack}>
+      <fieldset disabled={busy} className="space-y-5 disabled:opacity-80">
       <div className="space-y-2"><label htmlFor="name" className="text-sm font-medium">Instance name</label><Input id="name" name="name" placeholder="TwoWeekMc" required maxLength={48} /></div>
       <div className="grid gap-4 sm:grid-cols-2">
         <div className="space-y-2"><label className="text-sm font-medium">Server type</label><Select name="serverType" value={serverType} onValueChange={(value) => setServerType(value as DetectedServerType)}><SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="VANILLA">Vanilla</SelectItem><SelectItem value="PAPER">Paper</SelectItem><SelectItem value="FABRIC">Fabric</SelectItem><SelectItem value="FORGE">Forge</SelectItem><SelectItem value="NEOFORGE">NeoForge</SelectItem></SelectContent></Select></div>
@@ -220,6 +225,7 @@ export function CreateInstanceForm() {
       </div>
       {message && <p className="rounded-md bg-secondary p-3 text-sm">{message}</p>}
       <Button disabled={busy || analyzingPack}>{(busy || analyzingPack) && <Loader2 className="size-4 animate-spin" />}{busy ? "Preparing instance..." : analyzingPack ? "Reading modpack..." : "Create instance"}</Button>
+      </fieldset>
     </form>
     <form action={uploadMissingMods} className="space-y-3 rounded-lg border p-4">
       <div className="space-y-1">

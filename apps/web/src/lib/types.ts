@@ -27,6 +27,14 @@ export type InstanceMod = {
   sizeBytes: number;
 };
 
+export type InstanceBackup = {
+  id: string;
+  kind: "scheduled" | "manual" | "pre_regenerate" | "pre_restore";
+  sizeBytes: number;
+  worldSeed: string | null;
+  createdAt: string;
+};
+
 export type DashboardSnapshot = {
   demoMode: boolean;
   actor: { email: string; role: UserRole; displayName: string };

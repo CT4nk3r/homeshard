@@ -1,6 +1,6 @@
 import { desc, eq, sql } from "drizzle-orm";
 import { getDb, hasDatabase } from "@/db/client";
-import { hosts, instanceMods, instances, packRevisions } from "@/db/schema";
+import { hosts, instanceBackups, instanceMods, instances, packRevisions } from "@/db/schema";
 import type { InstanceState } from "./types";
 
 export async function getInstanceDetail(id: string) {
@@ -18,15 +18,17 @@ export async function getInstanceDetail(id: string) {
       magicDnsName: "",
       packs: [],
       mods: [],
+      backups: [],
     };
   }
 
   const db = getDb();
   const instance = await db.query.instances.findFirst({ where: eq(instances.id, id) });
   if (!instance) return null;
-  const [packs, mods, host] = await Promise.all([
+  const [packs, mods, backups, host] = await Promise.all([
     db.select().from(packRevisions).where(eq(packRevisions.instanceId, id)).orderBy(desc(packRevisions.createdAt)),
     db.select().from(instanceMods).where(eq(instanceMods.instanceId, id)).orderBy(instanceMods.filename),
+    db.select().from(instanceBackups).where(eq(instanceBackups.instanceId, id)).orderBy(desc(instanceBackups.createdAt)),
     instance.hostId
       ? db.query.hosts.findFirst({ where: eq(hosts.id, instance.hostId) })
       : db.query.hosts.findFirst({
@@ -57,6 +59,13 @@ export async function getInstanceDetail(id: string) {
       filename: mod.filename,
       enabled: mod.enabled,
       sizeBytes: mod.sizeBytes,
+    })),
+    backups: backups.map((backup) => ({
+      id: backup.id,
+      kind: backup.kind as "scheduled" | "manual" | "pre_regenerate" | "pre_restore",
+      sizeBytes: backup.sizeBytes,
+      worldSeed: backup.worldSeed,
+      createdAt: backup.createdAt.toISOString(),
     })),
   };
 }

@@ -118,6 +118,20 @@ export const instanceMods = pgTable(
   ],
 );
 
+export const instanceBackups = pgTable(
+  "instance_backups",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    instanceId: uuid("instance_id").references(() => instances.id, { onDelete: "cascade" }).notNull(),
+    kind: text("kind").notNull(),
+    coldPath: text("cold_path").notNull(),
+    sizeBytes: bigint("size_bytes", { mode: "number" }).notNull(),
+    worldSeed: text("world_seed"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [index("instance_backups_instance_created_idx").on(table.instanceId, table.createdAt)],
+);
+
 export const commands = pgTable(
   "commands",
   {
