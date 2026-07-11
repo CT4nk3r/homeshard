@@ -25,6 +25,27 @@ Read the nearest nested `AGENTS.md` before changing one of these areas.
 - Preserve host-path identity mounts used by the agent and game containers.
 - Prefer focused changes over new abstractions in this small codebase.
 
+## macOS local development
+
+- macOS is fine for web development and local preview testing with Docker Desktop,
+  but it is not the production-equivalent homeserver runtime. Validate release
+  candidates on the Linux Docker host before promoting to live.
+- For a local Compose preview on macOS, copy
+  `infra/homeserver/preview.env.example` to `infra/homeserver/.env.preview` and
+  replace `/srv/homeshard-preview/*` paths with absolute paths under the user's
+  home directory, such as `/Users/<you>/homeshard-preview/instances`.
+- Create the preview folders before starting Compose, and ensure Docker Desktop
+  file sharing allows the parent directory.
+- Keep identity mounts intact: `HOST_INSTANCES_DIR`, `HOST_COLD_DIR`,
+  `HOST_STAGING_DIR`, and `HOST_MISSING_MODS_DIR` must be valid absolute paths
+  from both macOS and Docker Desktop because the agent passes them to the host
+  Docker daemon.
+- For local Mac testing, prefer `HOMESHARD_GAME_BIND_IP=0.0.0.0` or
+  `127.0.0.1`; do not assume the Linux homeserver's Tailscale bind address works
+  on macOS.
+- Do not run live deployment or promotion commands from a Mac unless the user
+  explicitly asks for that operation.
+
 ## Checks
 
 Run the smallest relevant checks, then broaden when a shared contract changed:
