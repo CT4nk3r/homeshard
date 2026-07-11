@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=${HOMESHARD_ROOT:-/srv/homeshard}
+owner=${HOMESHARD_OWNER:-$(id -un):$(id -gn)}
+
+dirs=(
+  "$root/deploy"
+  "$root/config"
+  "$root/runtime/live/instances"
+  "$root/runtime/live/cold"
+  "$root/runtime/live/staging"
+  "$root/runtime/live/missing-mods"
+  "$root/runtime/preview/instances"
+  "$root/runtime/preview/cold"
+  "$root/runtime/preview/staging"
+  "$root/runtime/preview/missing-mods"
+)
+
+printf 'Creating Homeshard environment layout under %s\n' "$root"
+sudo mkdir -p "${dirs[@]}"
+sudo chown -R "$owner" "$root/deploy" "$root/config" "$root/runtime"
+
+printf '\nCreated/verified:\n'
+find "$root/deploy" "$root/config" "$root/runtime" -maxdepth 3 -type d -printf '  %p\n' | sort
+
+printf '\nNext config files to create:\n'
+printf '  %s/config/live.env from infra/homeserver/.env.live.example\n' "$root"
+printf '  %s/config/preview.env from infra/homeserver/.env.preview.example\n' "$root"

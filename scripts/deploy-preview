@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source_repo=${HOMESHARD_SOURCE_REPO:-/srv/homeshard/source}
+worktree=${HOMESHARD_PREVIEW_WORKTREE:-/srv/homeshard/deploy/preview}
+env_file=${HOMESHARD_PREVIEW_ENV:-/srv/homeshard/config/preview.env}
+commit=${1:-HEAD}
+
+env_value() {
+  local key="$1"
+  local file="$2"
+  awk -F= -v key="$key" '$1 == key { print substr($0, length($1) + 2); exit }' "$file"
+}
+
+require_file() {
+  if [ ! -f "$1" ]; then
+    printf 'Missing required file: %s\n' "$1" >&2
+    exit 1
+  fi
+}
+
+require_file "$env_file"
+
+resolved_commit=$(git -C "$source_repo" rev-parse "$commit")
+
+if [ ! -d "$worktree/.git" ] && [ ! -f "$worktree/.git" ]; then
+  git -C "$source_repo" worktree add --detach "$worktree" "$resolved_commit"
+else
+  if [ -n "$(git -C "$worktree" status --porcelain)" ]; then
+    printf 'Preview worktree has local changes: %s\n' "$worktree" >&2
+    exit 1
+  fi
+  git -C "$worktree" fetch --all --prune
+  git -C "$worktree" checkout --detach "$resolved_commit"
+fi
+
+project_name=$(env_value COMPOSE_PROJECT_NAME "$env_file")
+project_name=${project_name:-homeshard-preview}
+
+printf 'Deploying preview commit %s from %s\n' "$(git -C "$worktree" rev-parse --short HEAD)" "$worktree"
+(
+  cd "$worktree/infra/homeserver"
+  docker compose --env-file "$env_file" --project-name "$project_name" --profile agent up -d --build
+)
+
+printf '\nPreview deployed. Run scripts/status-envs and verify port 8012 before promoting.\n'

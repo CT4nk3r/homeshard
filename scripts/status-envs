@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+containers=(
+  homeshard-live-web-1
+  homeshard-live-agent-1
+  homeshard-live-postgres-1
+  homeshard-preview-web-1
+  homeshard-preview-agent-1
+  homeshard-preview-postgres-1
+  homeshard-test-web-1
+  homeshard-test-agent-1
+  homeshard-test-postgres-1
+  homeshard-web-1
+  homeshard-postgres-1
+)
+
+mask_env() {
+  case "$1" in
+    DATABASE_URL=*|POSTGRES_PASSWORD=*|CLERK_SECRET_KEY=*|AGENT_TOKEN=*|BLOB_READ_WRITE_TOKEN=*|CF_API_KEY=*)
+      printf '%s=<masked>\n' "${1%%=*}"
+      ;;
+    *)
+      printf '%s\n' "$1"
+      ;;
+  esac
+}
+
+print_container() {
+  local name="$1"
+
+  if ! docker inspect "$name" >/dev/null 2>&1; then
+    printf '\n## %s\nmissing\n' "$name"
+    return
+  fi
+
+  printf '\n## %s\n' "$name"
+  docker inspect --format 'image={{.Config.Image}} status={{.State.Status}} project={{index .Config.Labels "com.docker.compose.project"}} workdir={{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$name"
+  docker port "$name" 2>/dev/null | sed 's/^/port=/' || true
+
+  printf 'env:\n'
+  local env_lines
+  env_lines="$(
+    docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$name" |
+      grep -E '^((COMPOSE_PROJECT_NAME|WEB_PORT|DATABASE_URL|NODE_ENV|CLERK_SECRET_KEY|AGENT_TOKEN|CF_API_KEY)=|POSTGRES_[^=]*=|HOMESHARD_[^=]*=|HOST_[^=]*=|NEXT_PUBLIC_CLERK[^=]*=|BLOB_[^=]*=)' || true
+  )"
+  if [ -n "$env_lines" ]; then
+    while IFS= read -r line; do
+      printf '  '
+      mask_env "$line"
+    done <<< "$env_lines"
+  fi
+
+  printf 'mounts:\n'
+  docker inspect --format '{{range .Mounts}}{{println .Source "->" .Destination}}{{end}}' "$name" |
+    sed 's/^/  /'
+}
+
+printf '# Homeshard environment status\n'
+printf 'generated_at=%s\n' "$(date -Is)"
+
+printf '\n# Source checkout\n'
+if git -C /srv/homeshard/source rev-parse --git-dir >/dev/null 2>&1; then
+  printf 'path=/srv/homeshard/source\n'
+  printf 'branch=%s\n' "$(git -C /srv/homeshard/source branch --show-current)"
+  printf 'commit=%s\n' "$(git -C /srv/homeshard/source rev-parse --short HEAD)"
+  printf 'status=%s\n' "$(git -C /srv/homeshard/source status --short | wc -l | tr -d ' ') changed files"
+fi
+
+printf '\n# Git worktrees\n'
+git -C /srv/homeshard/source worktree list 2>/dev/null || true
+
+printf '\n# Homeshard containers\n'
+for container in "${containers[@]}"; do
+  print_container "$container"
+done
+
+printf '\n# Runtime directory sizes\n'
+for path in \
+  /srv/homeshard/instances \
+  /srv/homeshard/cold \
+  /srv/homeshard/runtime \
+  /srv/homeshard/runtime/live \
+  /srv/homeshard/runtime/preview \
+  /srv/server-manager/instances \
+  /srv/homeshard-preview/instances \
+  /srv/homeshard-preview/cold
+do
+  if [ -e "$path" ]; then
+    du -sh "$path" 2>/dev/null || true
+  fi
+done

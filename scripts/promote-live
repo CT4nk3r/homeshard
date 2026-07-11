@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source_repo=${HOMESHARD_SOURCE_REPO:-/srv/homeshard/source}
+preview_worktree=${HOMESHARD_PREVIEW_WORKTREE:-/srv/homeshard/deploy/preview}
+live_worktree=${HOMESHARD_LIVE_WORKTREE:-/srv/homeshard/deploy/live}
+env_file=${HOMESHARD_LIVE_ENV:-/srv/homeshard/config/live.env}
+commit=${1:-}
+
+env_value() {
+  local key="$1"
+  local file="$2"
+  awk -F= -v key="$key" '$1 == key { print substr($0, length($1) + 2); exit }' "$file"
+}
+
+require_file() {
+  if [ ! -f "$1" ]; then
+    printf 'Missing required file: %s\n' "$1" >&2
+    exit 1
+  fi
+}
+
+require_file "$env_file"
+
+if [ -z "$commit" ]; then
+  if [ ! -d "$preview_worktree/.git" ] && [ ! -f "$preview_worktree/.git" ]; then
+    printf 'Preview worktree does not exist yet: %s\n' "$preview_worktree" >&2
+    printf 'Run scripts/deploy-preview first, verify it, then promote.\n' >&2
+    exit 1
+  fi
+  commit=$(git -C "$preview_worktree" rev-parse HEAD)
+fi
+
+resolved_commit=$(git -C "$source_repo" rev-parse "$commit")
+
+if [ ! -d "$live_worktree/.git" ] && [ ! -f "$live_worktree/.git" ]; then
+  git -C "$source_repo" worktree add --detach "$live_worktree" "$resolved_commit"
+else
+  if [ -n "$(git -C "$live_worktree" status --porcelain)" ]; then
+    printf 'Live worktree has local changes: %s\n' "$live_worktree" >&2
+    exit 1
+  fi
+  git -C "$live_worktree" fetch --all --prune
+  git -C "$live_worktree" checkout --detach "$resolved_commit"
+fi
+
+project_name=$(env_value COMPOSE_PROJECT_NAME "$env_file")
+project_name=${project_name:-homeshard-live}
+
+printf 'Promoting live to commit %s from %s\n' "$(git -C "$live_worktree" rev-parse --short HEAD)" "$live_worktree"
+(
+  cd "$live_worktree/infra/homeserver"
+  docker compose --env-file "$env_file" --project-name "$project_name" --profile agent up -d --build
+)
+
+printf '\nLive promoted. Run scripts/status-envs and verify port 8010 plus active instance mounts.\n'

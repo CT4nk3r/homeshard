@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+live_instances=${HOMESHARD_LIVE_INSTANCES_DIR:-/srv/server-manager/instances}
+backup_parent=${HOMESHARD_LIVE_BACKUP_PARENT:-/mnt/nextcloud/server-manager/migration-backups}
+postgres_container=${HOMESHARD_LIVE_POSTGRES_CONTAINER:-homeshard-test-postgres-1}
+postgres_user=${HOMESHARD_LIVE_POSTGRES_USER:-homeshard}
+postgres_db=${HOMESHARD_LIVE_POSTGRES_DB:-homeshard}
+timestamp=${HOMESHARD_BACKUP_TIMESTAMP:-$(date +%Y%m%d-%H%M%S)}
+backup_dir="$backup_parent/pre-migration-$timestamp"
+
+if [ ! -d "$live_instances" ]; then
+  printf 'Live instances directory does not exist: %s\n' "$live_instances" >&2
+  exit 1
+fi
+
+if [ -e "$backup_dir" ]; then
+  printf 'Backup directory already exists: %s\n' "$backup_dir" >&2
+  exit 1
+fi
+
+mkdir -p "$backup_dir"
+
+printf 'Backing up live instances from %s\n' "$live_instances"
+printf 'Backup destination: %s\n' "$backup_dir"
+
+{
+  printf 'created_at=%s\n' "$(date -Is)"
+  printf 'source_instances=%s\n' "$live_instances"
+  printf 'postgres_container=%s\n' "$postgres_container"
+  printf 'postgres_db=%s\n' "$postgres_db"
+  printf 'source_git_commit=%s\n' "$(git -C /srv/homeshard/source rev-parse HEAD 2>/dev/null || true)"
+  printf '\n# Source instance directories\n'
+  find "$live_instances" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort
+} > "$backup_dir/MANIFEST.txt"
+
+find "$live_instances" -mindepth 1 -maxdepth 1 -type d -exec du -sh {} + 2>/dev/null |
+  sort -h > "$backup_dir/source-sizes.txt"
+
+docker inspect homeshard-test-web-1 homeshard-test-agent-1 "$postgres_container" > "$backup_dir/live-docker-inspect.json"
+
+docker exec "$postgres_container" pg_dump \
+  -U "$postgres_user" \
+  -d "$postgres_db" \
+  --format=custom \
+  --no-owner \
+  --no-acl \
+  > "$backup_dir/${postgres_db}.dump"
+
+rsync -aHAX --numeric-ids --delete \
+  "$live_instances/" \
+  "$backup_dir/instances/"
+
+find "$backup_dir/instances" -mindepth 1 -maxdepth 1 -type d -exec du -sh {} + 2>/dev/null |
+  sort -h > "$backup_dir/backup-sizes.txt"
+
+find "$live_instances" -type f -printf '%P\t%s\t%T@\n' | sort > "$backup_dir/source-file-list.txt"
+find "$backup_dir/instances" -type f -printf '%P\t%s\t%T@\n' | sort > "$backup_dir/backup-file-list.txt"
+
+if ! diff -u "$backup_dir/source-file-list.txt" "$backup_dir/backup-file-list.txt" > "$backup_dir/file-list.diff"; then
+  printf 'Backup file listing differs from source. See %s\n' "$backup_dir/file-list.diff" >&2
+  exit 1
+fi
+
+rsync -aHAXn --numeric-ids --delete --itemize-changes \
+  "$live_instances/" \
+  "$backup_dir/instances/" > "$backup_dir/rsync-dry-run-after.txt"
+
+if [ -s "$backup_dir/rsync-dry-run-after.txt" ]; then
+  printf 'Backup is not clean after verification. See %s\n' "$backup_dir/rsync-dry-run-after.txt" >&2
+  exit 1
+fi
+
+{
+  printf '\n# Backup instance directories\n'
+  find "$backup_dir/instances" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort
+  printf '\n# Backup sizes\n'
+  cat "$backup_dir/backup-sizes.txt"
+  printf '\n# Database dump\n'
+  ls -lh "$backup_dir/${postgres_db}.dump"
+} >> "$backup_dir/MANIFEST.txt"
+
+printf '\nBackup verified successfully.\n'
+printf 'Path: %s\n' "$backup_dir"
